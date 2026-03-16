@@ -37,3 +37,17 @@ Feature: Blockchain Scanning
     And I perform a scan with batch size "5"
     Then blocks should be fetched in batches of "5"
     And the scan should complete successfully
+
+  Scenario: Fast sync with small safety buffer
+    Given I have a seed node MinerNode
+    And I have a test database with an existing wallet
+    When I mine 10 blocks on MinerNode
+    And I perform a fast sync with safety buffer "5"
+    Then the fast sync should complete successfully
+
+  Scenario: Fast sync completes successfully
+    Given I have a seed node MinerNode
+    And I have a test database with an existing wallet
+    When I mine 10 blocks on MinerNode
+    And I perform a fast sync
+    Then the fast sync should complete successfully

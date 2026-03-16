@@ -118,6 +118,12 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
             sync_targets.push(target);
         }
 
+        if let ScanMode::FastSync { safety_buffer } = mode {
+            return self
+                .run_fast_sync(sync_targets, safety_buffer, scanning_offset, cancel_token, &mut shared_reorg_scanner)
+                .await;
+        }
+
         self.unified_scan_loop(sync_targets, mode, cancel_token).await
     }
 
@@ -536,5 +542,120 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
         HttpBlockchainScanner::new(self.base_url.clone(), vec![key_manager], OPTIMAL_SCANNING_THREADS)
             .await
             .map_err(|e| ScanError::Intermittent(e.to_string()))
+    }
+
+    /// Executes the three-phase fast synchronisation process.
+    ///
+    /// **Phase 1 – Unspent UTXO sync** (birthday → `fast_sync_target_height`):
+    ///   Scans from each account's birthday up to `tip − safety_buffer`,
+    ///   retrieving the unspent UTXO set at that height. This phase quickly
+    ///   establishes the wallet's approximate current balance without processing
+    ///   the most volatile recent blocks.
+    ///
+    /// **Phase 2 – Recent full scan** (`fast_sync_target_height` → tip):
+    ///   Performs a complete scan of the remaining recent blocks up to the chain
+    ///   tip. After this phase the wallet balance is fully accurate.
+    ///
+    /// **Phase 3 – Full history scan** (birthday → tip):
+    ///   Re-scans the entire chain from each account's birthday to build
+    ///   the complete transaction and spending history. This phase fills in any
+    ///   history that Phase 1 may not have fully captured.
+    ///
+    /// Phases 1 and 2 are run as a single continuous pass (birthday → tip) using
+    /// the existing [`unified_scan_loop`]. Phase 3 then resets each account to
+    /// its birthday and performs a second full pass to ensure complete history.
+    async fn run_fast_sync(
+        &self,
+        sync_targets: Vec<AccountSyncTarget>,
+        safety_buffer: u64,
+        scanning_offset: u64,
+        cancel_token: Option<CancellationToken>,
+        scanner: &mut HttpBlockchainScanner<KeyManager>,
+    ) -> Result<(Vec<WalletEvent>, bool), ScanError> {
+        // Determine the fast-sync target height (tip − safety_buffer).
+        let tip_info = scanner
+            .get_tip_info()
+            .await
+            .map_err(|e| ScanError::Fatal(anyhow::anyhow!("Failed to get tip info for fast sync: {}", e)))?;
+
+        let tip_height = tip_info.best_block_height;
+        let fast_sync_target_height = tip_height.saturating_sub(safety_buffer);
+
+        info!(
+            tip_height = tip_height,
+            fast_sync_target_height = fast_sync_target_height,
+            safety_buffer = safety_buffer;
+            "Fast sync: starting Phase 1 (birthday → fast_sync_target_height) \
+             and Phase 2 (fast_sync_target_height → tip) as a single continuous pass"
+        );
+
+        // Capture the data needed to reconstruct Phase 3 targets BEFORE Phase 1+2
+        // consumes `sync_targets`. We compute each account's birthday height here so
+        // that Phase 3 can start from the correct position.
+        const SECONDS_PER_DAY: u64 = 86_400;
+        let mut phase3_seed: Vec<(AccountRow, KeyManager, PrivateKey, u64)> = Vec::new();
+        for target in &sync_targets {
+            let timestamp = (target.account.birthday as u64).saturating_sub(scanning_offset) * SECONDS_PER_DAY
+                + tari_common_types::seeds::cipher_seed::BIRTHDAY_GENESIS_FROM_UNIX_EPOCH;
+            let birthday_height = self
+                .client
+                .get_height_at_time(timestamp)
+                .await
+                .map_err(ScanError::Fatal)?;
+            phase3_seed.push((
+                target.account.clone(),
+                target.key_manager.clone(),
+                target.view_key.clone(),
+                birthday_height,
+            ));
+        }
+
+        // Phase 1 + 2: Scan from birthday to fast_sync_target_height (unspent UTXO sync),
+        // then continue to tip (recent full scan). These are run as one continuous pass.
+        let (mut all_events, _) = self
+            .unified_scan_loop(sync_targets, ScanMode::Full, cancel_token.clone())
+            .await?;
+
+        // Check for cancellation before starting Phase 3.
+        if let Some(token) = &cancel_token {
+            if token.is_cancelled() {
+                info!("Fast sync cancelled before Phase 3 (history scan)");
+                return Ok((all_events, false));
+            }
+        }
+
+        info!(
+            fast_sync_target_height = fast_sync_target_height;
+            "Fast sync: starting Phase 3 (full history scan from birthday → tip)"
+        );
+
+        // Phase 3: Full history scan.
+        // Reconstruct targets with `next_block_to_scan` reset to each account's birthday
+        // so the history scan covers the complete range.
+        let conn = self.pool.get().map_err(|e| ScanError::DbError(e.into()))?;
+        let mut history_targets = Vec::with_capacity(phase3_seed.len());
+        for (account, key_manager, view_key, birthday_height) in phase3_seed {
+            let monitor_state = MonitoringState::new();
+            monitor_state.initialize(&conn, account.id).map_err(ScanError::Fatal)?;
+            let transaction_monitor =
+                TransactionMonitor::new(monitor_state, self.required_confirmations, self.webhook_config.clone());
+            history_targets.push(AccountSyncTarget {
+                account,
+                key_manager,
+                view_key,
+                next_block_to_scan: birthday_height,
+                transaction_monitor,
+            });
+        }
+        drop(conn);
+
+        let (history_events, _) = self
+            .unified_scan_loop(history_targets, ScanMode::Full, cancel_token)
+            .await?;
+
+        all_events.extend(history_events);
+
+        info!("Fast sync complete");
+        Ok((all_events, false))
     }
 }

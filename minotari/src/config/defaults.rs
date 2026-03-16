@@ -25,6 +25,11 @@ pub struct WalletConfig {
     pub confirmation_window: u64,
     pub account_name: Option<String>,
     pub webhook: WebhookConfig,
+    /// Safety buffer (in blocks) for fast sync.
+    ///
+    /// The fast-sync target height is `tip - fast_sync_safety_buffer`.
+    /// If not set, the default value of 720 blocks (approximately 12 hours on mainnet) is used.
+    pub fast_sync_safety_buffer: Option<u64>,
 }
 
 impl Default for WalletConfig {
@@ -39,6 +44,7 @@ impl Default for WalletConfig {
             confirmation_window: 3,
             account_name: None,
             webhook: WebhookConfig::default(),
+            fast_sync_safety_buffer: None,
         }
     }
 }

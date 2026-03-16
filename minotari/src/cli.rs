@@ -151,6 +151,13 @@ pub enum Commands {
     ///
     /// - `max_blocks_to_scan`: Limits scan duration (default: 50)
     /// - `batch_size`: Number of blocks per API request (default: 100)
+    ///
+    /// # Fast Sync
+    ///
+    /// Use `--fast-sync` to run a three-phase fast synchronisation:
+    /// 1. Scans birthday → `tip - safety_buffer` for the unspent UTXO set
+    /// 2. Scans `tip - safety_buffer` → tip for recent changes
+    /// 3. Rescans birthday → tip to fill in the complete transaction history
     Scan {
         #[command(flatten)]
         security: SecurityArgs,
@@ -164,6 +171,23 @@ pub enum Commands {
         /// Maximum number of blocks to scan in this invocation.
         #[arg(short = 'n', long, default_value_t = 50)]
         max_blocks_to_scan: u64,
+
+        /// Enable fast synchronisation mode.
+        ///
+        /// When set, the scanner runs three phases to quickly establish the current
+        /// wallet balance before filling in the full transaction history:
+        /// 1. birthday → tip-safety_buffer  (unspent UTXO set)
+        /// 2. tip-safety_buffer → tip        (recent full scan)
+        /// 3. birthday → tip                 (full history)
+        #[arg(long, default_value_t = false)]
+        fast_sync: bool,
+
+        /// Safety buffer (in blocks) used when calculating the fast-sync target height.
+        ///
+        /// `fast_sync_target_height = tip - fast_sync_safety_buffer`.
+        /// Only used when `--fast-sync` is set. Defaults to 720 blocks.
+        #[arg(long)]
+        fast_sync_safety_buffer: Option<u64>,
     },
 
     /// Re-scan the blockchain from a specific height.
