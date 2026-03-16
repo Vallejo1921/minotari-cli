@@ -288,6 +288,8 @@ async fn main() -> Result<(), anyhow::Error> {
             db,
             account,
             max_blocks_to_scan,
+            fast_sync,
+            fast_sync_safety_buffer,
         } => {
             info!("Scanning blockchain...");
 
@@ -295,13 +297,22 @@ async fn main() -> Result<(), anyhow::Error> {
             wallet_config.apply_database(&db);
             wallet_config.apply_account(&account);
 
-            let (events, _more_blocks_to_scan) = scan(
-                &security.password,
-                &wallet_config,
-                max_blocks_to_scan,
-                wallet_config.account_name.as_deref(),
-            )
-            .await?;
+            let (events, _more_blocks_to_scan) = if fast_sync {
+                let safety_buffer = fast_sync_safety_buffer
+                    .or(wallet_config.fast_sync_safety_buffer)
+                    .unwrap_or(scan::DEFAULT_FAST_SYNC_SAFETY_BUFFER);
+                info!(safety_buffer = safety_buffer; "Fast sync enabled");
+                fast_sync_scan(&security.password, &wallet_config, safety_buffer, wallet_config.account_name.as_deref())
+                    .await?
+            } else {
+                scan(
+                    &security.password,
+                    &wallet_config,
+                    max_blocks_to_scan,
+                    wallet_config.account_name.as_deref(),
+                )
+                .await?
+            };
             info!(event_count = events.len(); "Scan complete");
             Ok(())
         },
@@ -580,6 +591,36 @@ async fn scan(
         config.confirmation_window,
     )
     .mode(scan::ScanMode::Partial { max_blocks });
+
+    if let Some(name) = account_name {
+        scanner = scanner.account(name);
+    }
+
+    if let Some(url) = &config.webhook.url {
+        let trigger_config = WebhookTriggerConfig {
+            url: url.clone(),
+            send_only_event_types: config.webhook.send_only_event_types.clone(),
+        };
+        scanner = scanner.webhook_config(trigger_config);
+    }
+
+    scanner.run().await
+}
+
+async fn fast_sync_scan(
+    password: &str,
+    config: &WalletConfig,
+    safety_buffer: u64,
+    account_name: Option<&str>,
+) -> Result<(Vec<WalletEvent>, bool), ScanError> {
+    let mut scanner = scan::Scanner::new(
+        password,
+        &config.base_url,
+        config.database_path.clone(),
+        config.batch_size,
+        config.confirmation_window,
+    )
+    .mode(scan::ScanMode::FastSync { safety_buffer });
 
     if let Some(name) = account_name {
         scanner = scanner.account(name);

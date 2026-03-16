@@ -8,6 +8,10 @@ scan_interval_secs = 60
 api_port = 9000
 confirmation_window = 3
 account_name = "default"
+# Safety buffer (in blocks) used when running fast sync.
+# fast_sync_target_height = tip - fast_sync_safety_buffer
+# Defaults to 720 blocks (~12 hours on mainnet) if not set.
+# fast_sync_safety_buffer = 720
 
 # [wallet.webhook]
 # url = "https://your-api.com/webhook"

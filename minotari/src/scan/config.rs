@@ -20,6 +20,13 @@ pub const MAX_BACKOFF_SECONDS: u64 = 60;
 
 pub const OPTIMAL_SCANNING_THREADS: usize = 0; // Based on num_cpus
 
+/// Default safety buffer (in blocks) for fast sync.
+///
+/// The fast sync target height is calculated as `tip - DEFAULT_FAST_SYNC_SAFETY_BUFFER`.
+/// This buffer ensures we have a stable UTXO set snapshot that is unlikely to be affected
+/// by chain reorganisations during the fast scan phase.
+pub const DEFAULT_FAST_SYNC_SAFETY_BUFFER: u64 = 720;
+
 /// Configuration for scan operation timeouts.
 ///
 /// This is a simplified configuration struct for controlling timeout behavior.
@@ -74,6 +81,11 @@ impl Default for ScanTimeoutConfig {
 /// let continuous = ScanMode::Continuous {
 ///     poll_interval: Duration::from_secs(30),
 /// };
+///
+/// // Fast sync with default safety buffer
+/// let fast_sync = ScanMode::FastSync {
+///     safety_buffer: DEFAULT_FAST_SYNC_SAFETY_BUFFER,
+/// };
 /// ```
 #[derive(Debug, Clone)]
 pub enum ScanMode {
@@ -100,6 +112,40 @@ pub enum ScanMode {
     Continuous {
         /// Duration to wait between scan cycles after reaching chain tip.
         poll_interval: Duration,
+    },
+
+    /// Fast synchronisation that prioritises getting an accurate current balance
+    /// quickly before filling in the full transaction history.
+    ///
+    /// The fast sync process runs three sequential phases:
+    ///
+    /// 1. **Phase 1 – Unspent UTXO sync** (birthday → `tip - safety_buffer`):
+    ///    Scans from the wallet birthday up to the *fast-sync target height*
+    ///    (`tip - safety_buffer`), retrieving the unspent UTXO set at that
+    ///    height. This phase rapidly establishes an accurate picture of
+    ///    outputs that belong to the wallet without scanning the most recent
+    ///    (and most volatile) blocks.
+    ///
+    /// 2. **Phase 2 – Recent full scan** (`fast_sync_target_height` → tip):
+    ///    Performs a complete scan of the remaining, recent blocks up to the
+    ///    chain tip. After this phase the wallet balance is fully accurate.
+    ///
+    /// 3. **Phase 3 – Full history scan** (birthday → tip):
+    ///    Re-scans the entire range from the wallet birthday to the tip to
+    ///    build complete transaction history (including spending records for
+    ///    outputs that may have been spent within the Phase 1 range).
+    ///
+    /// # Safety Buffer
+    ///
+    /// The `safety_buffer` defines how many blocks from the tip to treat as
+    /// "recent". A larger buffer means Phase 1 covers a smaller range and
+    /// Phase 2 covers a larger range. The default is [`DEFAULT_FAST_SYNC_SAFETY_BUFFER`]
+    /// (720 blocks, approximately 12 hours on mainnet).
+    FastSync {
+        /// Number of blocks from the tip that are treated as the "recent" zone.
+        ///
+        /// `fast_sync_target_height = tip_height - safety_buffer`.
+        safety_buffer: u64,
     },
 }
 

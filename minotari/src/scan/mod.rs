@@ -97,6 +97,7 @@ mod coordinator;
 mod scanner_state_manager;
 
 pub use builder::Scanner;
+pub use config::DEFAULT_FAST_SYNC_SAFETY_BUFFER;
 pub use config::ScanMode;
 pub use config::ScanRetryConfig;
 pub use config::ScanTimeoutConfig;
