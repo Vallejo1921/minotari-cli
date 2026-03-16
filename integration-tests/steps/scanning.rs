@@ -192,3 +192,60 @@ async fn blocks_in_batches(world: &mut MinotariWorld, _batch_size: String) {
     // Verify scan with custom batch size completed
     scan_succeeds(world).await;
 }
+
+#[when(regex = r#"^I perform a fast sync with safety buffer "([^"]*)"$"#)]
+async fn fast_sync_with_safety_buffer(world: &mut MinotariWorld, safety_buffer: String) {
+    let db_path = world.database_path.as_ref().expect("Database not set up");
+
+    // Get base node URL from the first available base node
+    let base_url = if let Some((_, node)) = world.base_nodes.iter().next() {
+        format!("http://127.0.0.1:{}", node.http_port)
+    } else {
+        panic!("No base node available for scanning");
+    };
+
+    let (cmd, mut args) = world.get_minotari_command();
+    args.extend_from_slice(&[
+        "scan".to_string(),
+        "--database-path".to_string(),
+        db_path.to_str().unwrap().to_string(),
+        "--password".to_string(),
+        world.test_password.clone(),
+        "--base-url".to_string(),
+        base_url,
+        "--fast-sync".to_string(),
+        "--fast-sync-safety-buffer".to_string(),
+        safety_buffer,
+    ]);
+
+    let output = Command::new(&cmd)
+        .args(&args)
+        .output()
+        .expect("Failed to execute fast sync command");
+
+    world.last_command_exit_code = Some(output.status.code().unwrap_or(-1));
+    world.last_command_output = Some(String::from_utf8_lossy(&output.stdout).to_string());
+    world.last_command_error = Some(String::from_utf8_lossy(&output.stderr).to_string());
+
+    println!("Fast sync output: {}", world.last_command_output.as_ref().unwrap());
+    if !world.last_command_error.as_ref().unwrap().is_empty() {
+        println!("Fast sync stderr: {}", world.last_command_error.as_ref().unwrap());
+    }
+}
+
+#[when("I perform a fast sync")]
+async fn fast_sync_default(world: &mut MinotariWorld) {
+    // Use a small safety buffer (5 blocks) in tests so fast sync completes quickly
+    // even when only a few blocks have been mined. The production default is 720 blocks.
+    fast_sync_with_safety_buffer(world, "5".to_string()).await;
+}
+
+#[then("the fast sync should complete successfully")]
+async fn fast_sync_succeeds(world: &mut MinotariWorld) {
+    assert_eq!(
+        world.last_command_exit_code,
+        Some(0),
+        "Fast sync command failed: {}",
+        world.last_command_error.as_deref().unwrap_or("")
+    );
+}

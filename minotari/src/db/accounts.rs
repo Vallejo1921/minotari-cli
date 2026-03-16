@@ -155,7 +155,7 @@ pub fn get_accounts(conn: &Connection, friendly_name: Option<&str>) -> WalletDbR
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountRow {
     pub id: i64,
     pub friendly_name: String,
