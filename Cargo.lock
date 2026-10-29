@@ -3265,7 +3265,7 @@ checksum = "8bb03732005da905c88227371639bf1ad885cc712789c011c31c5fb3ab3ccf02"
 
 [[package]]
 name = "integration-tests"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3930,7 +3930,7 @@ dependencies = [
 
 [[package]]
 name = "minotari"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "argon2 0.6.0",
@@ -3985,7 +3985,7 @@ dependencies = [
 
 [[package]]
 name = "minotari-scanning"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "async-trait",

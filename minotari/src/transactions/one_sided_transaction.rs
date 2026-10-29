@@ -41,6 +41,7 @@
 //! ```
 
 use crate::db::SqlitePool;
+use crate::transactions::fee_estimator::{estimated_output_size_for_payment_id, measure_output_size};
 use crate::transactions::fund_locker::validate_fee_per_gram;
 use crate::transactions::idempotency::{IdempotencyBinding, IdempotencyOperation, RequestFingerprint};
 use crate::transactions::input_selector::map_change_required_error;
@@ -48,7 +49,12 @@ use crate::{api::types::LockFundsResult, db::AccountRow};
 use anyhow::anyhow;
 use log::info;
 use tari_common::configuration::Network;
-use tari_common_types::{tari_address::TariAddress, transaction::TxId};
+use tari_common_types::{
+    tari_address::{TariAddress, TariAddressFeatures},
+    transaction::TxId,
+    types::FixedHash,
+};
+use tari_script::script;
 use tari_transaction_components::offline_signing::models::PaymentRecipient;
 use tari_transaction_components::{
     TransactionBuilder,
@@ -92,6 +98,27 @@ pub struct Recipient {
     pub payment_id: Option<String>,
 }
 
+impl Recipient {
+    /// The payment id bytes the output carries. When the address has the payment id feature,
+    /// its embedded id replaces `payment_id`, as the console wallet does: exchanges put the
+    /// deposit reference in the address, and it can be any bytes, not only text.
+    pub fn payment_id_bytes(&self) -> Option<Vec<u8>> {
+        if self.address.features().contains(TariAddressFeatures::PAYMENT_ID) {
+            Some(self.address.get_memo_field_payment_id_bytes())
+        } else {
+            self.payment_id.as_ref().map(|s| s.as_bytes().to_vec())
+        }
+    }
+
+    /// The plain memo for this recipient, before [`recipient_memo`] adds the sender address.
+    pub fn memo(&self) -> Result<MemoField, anyhow::Error> {
+        match self.payment_id_bytes() {
+            Some(bytes) => MemoField::new_open(bytes, TxType::PaymentToOther).map_err(|e| anyhow!(e)),
+            None => Ok(MemoField::new_empty()),
+        }
+    }
+}
+
 /// The memo a recipient's output carries: the payment id, with the sender's address on it.
 ///
 /// A one-sided payment has no handshake, so the encrypted memo is the only place the recipient's
@@ -114,6 +141,51 @@ pub fn recipient_memo(
     payment_id
         .add_sender_address(sender_address.clone(), true, MicroMinotari::zero(), Some(tx_type))
         .map_err(|e| anyhow!("Payment id does not fit alongside the sender address: {e}"))
+}
+
+/// Builds every memo a send to `recipients` will carry and returns the per-output size input
+/// selection has to charge for them.
+///
+/// Call this before locking funds. A payment id embedded in an address can be up to 256 bytes,
+/// more than a memo holds once the sender address goes in with it, and the unsigned-transaction
+/// paths do not release their lock when the build fails. The change memo is the tightest: the
+/// builder writes it at signing time with the first recipient's address, which carries the
+/// embedded id a second time. It is built here the way `create_change_memo` builds it.
+pub fn check_memos_and_estimate_output_size(
+    recipients: &[Recipient],
+    sender_address: &TariAddress,
+) -> Result<usize, anyhow::Error> {
+    let first = recipients.first().ok_or_else(|| anyhow!("No recipients provided"))?;
+    let mut memos = recipients
+        .iter()
+        .map(|r| recipient_memo(r.memo()?, sender_address, &r.address))
+        .collect::<Result<Vec<_>, _>>()?;
+    // The builder records one sent hash per recipient output, and none past two.
+    let sent_hashes = if recipients.len() <= 2 { recipients.len() } else { 0 };
+    memos.push(
+        MemoField::new_transaction_info(
+            first.address.clone(),
+            MicroMinotari::zero(),
+            MicroMinotari::zero(),
+            true,
+            TxType::PaymentToOther,
+            vec![FixedHash::zero(); sent_hashes],
+            first.payment_id_bytes().unwrap_or_default(),
+        )
+        .map_err(|e| anyhow!("Payment id does not fit in the change output's memo: {e}"))?,
+    );
+
+    let longest = recipients
+        .iter()
+        .map(|r| r.payment_id_bytes().map_or(0, |bytes| bytes.len()))
+        .max()
+        .unwrap_or(0);
+    let script = script!(PushPubKey(Box::default())).map_err(|e| anyhow!("Failed to build the default script: {e}"))?;
+    memos
+        .iter()
+        .try_fold(estimated_output_size_for_payment_id(longest)?, |size, memo| {
+            Ok(size.max(measure_output_size(&OutputFeatures::default(), &script, memo)?))
+        })
 }
 
 /// Binds an idempotency key to an unsigned-transaction request.
@@ -296,12 +368,6 @@ impl OneSidedTransaction {
 
         let tx_id = TxId::new_random();
         let output_features = OutputFeatures::default();
-        let base_memo = |r: &Recipient| match &r.payment_id {
-            Some(s) => {
-                MemoField::new_open_from_string(s, TxType::PaymentToOther).unwrap_or_else(|_| MemoField::new_empty())
-            },
-            None => MemoField::new_empty(),
-        };
         let payment_recipients = recipients
             .iter()
             .map(|r| {
@@ -309,13 +375,13 @@ impl OneSidedTransaction {
                     amount: r.amount,
                     output_features: output_features.clone(),
                     address: r.address.clone(),
-                    payment_id: recipient_memo(base_memo(r), &sender_address, &r.address)?,
+                    payment_id: recipient_memo(r.memo()?, &sender_address, &r.address)?,
                 })
             })
             .collect::<Result<Vec<_>, anyhow::Error>>()?;
 
         // Use first recipient's payment_id, without the sender address, as the overall transaction memo
-        let main_payment_id = base_memo(recipients.first().expect("Already checked"));
+        let main_payment_id = recipients.first().expect("Already checked").memo()?;
 
         let result = prepare_one_sided_transaction_for_signing(
             &key_manager,
@@ -328,5 +394,101 @@ impl OneSidedTransaction {
         .map_err(map_change_required_error)?;
 
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tari_common_types::types::{CompressedPublicKey, PrivateKey};
+    use tari_transaction_components::offline_signing::{
+        ConfirmationMode, PayloadSummary, present_payload_summary, sign_locked_transaction,
+    };
+
+    use super::*;
+    use crate::transactions::{burn::tests::setup_funded_account, fund_locker::FundLocker};
+
+    const FEE: MicroMinotari = MicroMinotari(5);
+
+    fn deposit(payment_id_len: usize) -> Recipient {
+        Recipient {
+            address: TariAddress::new_dual_address_with_default_features(
+                CompressedPublicKey::from_secret_key(&PrivateKey::from(7u64)),
+                CompressedPublicKey::from_secret_key(&PrivateKey::from(9u64)),
+                Network::LocalNet,
+            )
+            .expect("address")
+            .with_memo_field_payment_id(vec![0xff; payment_id_len])
+            .expect("payment id"),
+            amount: MicroMinotari(1_000),
+            payment_id: None,
+        }
+    }
+
+    /// The whole send without the check: lock, build the unsigned transaction, sign it.
+    fn signs(recipient: Recipient) -> bool {
+        let (pool, account, _temp) = setup_funded_account(1_000_000);
+        let mut conn = pool.get().expect("conn");
+        let recipients = vec![recipient];
+        let binding = unsigned_transaction_binding(None, account.id, &recipients, FEE, 3600, 100);
+        let locked = FundLocker::new()
+            .lock(
+                &mut conn,
+                account.id,
+                MicroMinotari(1_000),
+                1,
+                FEE,
+                None,
+                binding,
+                3600,
+                100,
+            )
+            .expect("lock");
+        let one_sided = OneSidedTransaction::new(pool.clone(), Network::LocalNet, Zeroizing::new("pass".to_string()));
+        let Ok(prepared) = one_sided.create_unsigned_transaction(&account, locked, recipients, FEE) else {
+            return false;
+        };
+        let summary = PayloadSummary::from_one_sided(prepared);
+        let confirmation = present_payload_summary(
+            &summary,
+            ConfirmationMode::NonInteractive,
+            &mut std::io::sink(),
+            &mut std::io::empty(),
+        )
+        .expect("summary");
+        let key_manager = account.get_key_manager("pass").expect("key manager");
+        sign_locked_transaction(
+            &key_manager,
+            ConsensusConstantsBuilder::new(Network::LocalNet).build(),
+            Network::LocalNet,
+            summary.confirm(confirmation).expect("confirm"),
+        )
+        .map_err(map_change_required_error)
+        .is_ok()
+    }
+
+    /// The check has to refuse exactly the embedded ids the signer cannot build, so a send it
+    /// lets through never fails with funds already locked, and none it refuses would have worked.
+    #[test]
+    fn the_memo_check_matches_what_signing_can_build() {
+        let (_pool, account, _temp) = setup_funded_account(1_000_000);
+        let sender_address = account
+            .get_address(Network::LocalNet, &Zeroizing::new("pass".to_string()))
+            .expect("address");
+        let passes_check = |r: Recipient| check_memos_and_estimate_output_size(&[r], &sender_address).is_ok();
+
+        assert!(passes_check(deposit(8)));
+        assert!(
+            !passes_check(deposit(256)),
+            "the largest id an address holds cannot fit"
+        );
+        let longest = (0..=256)
+            .rev()
+            .find(|&len| passes_check(deposit(len)))
+            .expect("some id fits");
+        assert!(
+            signs(deposit(longest)),
+            "the check let through an id that cannot be signed"
+        );
+        assert!(!signs(deposit(longest + 1)), "the check refused an id that signs");
     }
 }
