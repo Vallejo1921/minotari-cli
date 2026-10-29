@@ -122,11 +122,22 @@ pub fn recipient_memo(
 }
 
 impl Recipient {
+    /// The payment id bytes the output carries. When the address has the payment id feature,
+    /// its embedded id replaces `payment_id`, as the console wallet does: exchanges put the
+    /// deposit reference in the address, and it can be any bytes, not only text.
+    pub fn payment_id_bytes(&self) -> Option<Vec<u8>> {
+        if self.address.features().contains(TariAddressFeatures::PAYMENT_ID) {
+            Some(self.address.get_memo_field_payment_id_bytes())
+        } else {
+            self.payment_id.as_ref().map(|s| s.as_bytes().to_vec())
+        }
+    }
+
     /// Its payment id as a plain memo: the transaction-level memo, which the
     /// change memo carries.
     pub fn payment_memo(&self) -> Result<MemoField, anyhow::Error> {
-        match &self.payment_id {
-            Some(s) => MemoField::new_open_from_string(s, TxType::PaymentToOther).map_err(|e| anyhow!(e)),
+        match self.payment_id_bytes() {
+            Some(bytes) => MemoField::new_open(bytes, TxType::PaymentToOther).map_err(|e| anyhow!(e)),
             None => Ok(MemoField::new_empty()),
         }
     }
@@ -487,5 +498,110 @@ mod tests {
         let long = "x".repeat(200);
         assert!(MemoField::new_open_from_string(&long, TxType::PaymentToOther).is_ok());
         total_recipient_amount(&[recipient(Some(long))], Network::MainNet).expect_err("too long for the change memo");
+    }
+
+    fn deposit(payment_id_len: usize) -> Recipient {
+        use tari_common_types::types::PrivateKey;
+        Recipient {
+            address: TariAddress::new_dual_address_with_default_features(
+                CompressedPublicKey::from_secret_key(&PrivateKey::from(7u64)),
+                CompressedPublicKey::from_secret_key(&PrivateKey::from(9u64)),
+                Network::LocalNet,
+            )
+            .expect("address")
+            .with_memo_field_payment_id(vec![0xff; payment_id_len])
+            .expect("payment id"),
+            amount: MicroMinotari(1_000),
+            payment_id: None,
+        }
+    }
+
+    /// The whole send without the pre-lock check: lock, build the unsigned transaction, sign it.
+    fn signs(recipient: Recipient) -> bool {
+        use crate::transactions::{burn::tests::setup_funded_account, fund_locker::FundLocker};
+        use tari_transaction_components::offline_signing::{
+            ConfirmationMode, PayloadSummary, present_payload_summary, sign_locked_transaction,
+        };
+
+        let fee = MicroMinotari(5);
+        let (pool, account, _temp) = setup_funded_account(1_000_000);
+        let mut conn = pool.get().expect("conn");
+        let recipients = vec![recipient];
+        let binding = unsigned_transaction_binding(None, account.id, &recipients, fee, 3600, 100, false);
+        let locked = FundLocker::new()
+            .lock(
+                &mut conn,
+                account.id,
+                MicroMinotari(1_000),
+                1,
+                fee,
+                None,
+                binding,
+                3600,
+                100,
+            )
+            .expect("lock");
+        let one_sided = OneSidedTransaction::new(pool.clone(), Network::LocalNet, Zeroizing::new("pass".to_string()));
+        let Ok(prepared) = one_sided.create_unsigned_transaction(&account, locked, recipients, fee) else {
+            return false;
+        };
+        let summary = PayloadSummary::from_one_sided(prepared);
+        let confirmation = present_payload_summary(
+            &summary,
+            ConfirmationMode::NonInteractive,
+            &mut std::io::sink(),
+            &mut std::io::empty(),
+        )
+        .expect("summary");
+        let key_manager = account.get_key_manager("pass").expect("key manager");
+        sign_locked_transaction(
+            &key_manager,
+            ConsensusConstantsBuilder::new(Network::LocalNet).build(),
+            Network::LocalNet,
+            summary.confirm(confirmation).expect("confirm"),
+        )
+        .map_err(map_change_required_error)
+        .is_ok()
+    }
+
+    /// An address's embedded id is counted twice in the change memo (in the address and as the
+    /// payment id), and the change memo is only built at signing. The pre-lock check has to
+    /// refuse exactly the ids signing cannot build, so nothing it lets through fails with the
+    /// funds locked and nothing it refuses would have worked.
+    #[test]
+    fn the_pre_lock_check_matches_what_signing_can_build_for_embedded_ids() {
+        let passes_check = |r: Recipient| total_recipient_amount(&[r], Network::LocalNet).is_ok();
+        assert!(passes_check(deposit(8)));
+        assert!(
+            !passes_check(deposit(256)),
+            "the largest id an address holds cannot fit"
+        );
+        let longest = (0..=256)
+            .rev()
+            .find(|&len| passes_check(deposit(len)))
+            .expect("some id fits");
+        assert!(
+            signs(deposit(longest)),
+            "the check let through an id that cannot be signed"
+        );
+        assert!(!signs(deposit(longest + 1)), "the check refused an id that signs");
+    }
+
+    /// An embedded id replaces the typed payment id, as its exact bytes, text or not.
+    #[test]
+    fn an_address_payment_id_replaces_the_typed_one_as_its_bytes() {
+        let embedded = vec![0x9c, 0xf1, 0x03, 0x00, 0xff, 0x80, 0x01, 0x00];
+        let mut r = deposit(0);
+        r.address = r
+            .address
+            .with_memo_field_payment_id(embedded.clone())
+            .expect("payment id");
+        r.payment_id = Some("typed message".to_string());
+        assert_eq!(r.payment_id_bytes(), Some(embedded.clone()));
+        assert_eq!(r.payment_memo().expect("memo").payment_id_as_bytes(), embedded);
+        assert_eq!(
+            recipient(Some("typed".into())).payment_id_bytes(),
+            Some(b"typed".to_vec())
+        );
     }
 }

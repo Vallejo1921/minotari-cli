@@ -315,7 +315,7 @@ pub fn estimated_output_size_for_send(
 pub fn estimated_output_size_for_recipients(recipients: &[Recipient]) -> Result<usize> {
     let largest_payment_id = recipients
         .iter()
-        .map(|r| r.payment_id.as_ref().map_or(0, String::len))
+        .map(|r| r.payment_id_bytes().map_or(0, |bytes| bytes.len()))
         .max()
         .unwrap_or(0);
     let default_address = TariAddress::default();
@@ -351,11 +351,7 @@ pub fn one_sided_output_sizes(recipients: &[Recipient], network: Network) -> Res
         true,
         TxType::PaymentToOther,
         vec![FixedHash::zero(); hash_count],
-        first
-            .payment_id
-            .as_deref()
-            .map(|s| s.as_bytes().to_vec())
-            .unwrap_or_default(),
+        first.payment_id_bytes().unwrap_or_default(),
     )
     .map_err(|e| anyhow!("Failed to build the change memo: {e}"))?;
     // Measured as the builder measures change: no covenant.
