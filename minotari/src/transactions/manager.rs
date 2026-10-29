@@ -1066,6 +1066,11 @@ impl TransactionSender {
             credit = change.value();
         }
 
+        // Record the bytes the output carries, which an address's embedded id may have replaced,
+        // not what was typed. The scan keeps this row, so it is what the history shows for good.
+        let sent_memo = recipient.payment_id_bytes().filter(|bytes| !bytes.is_empty());
+        let message = sent_memo.clone().and_then(|bytes| String::from_utf8(bytes).ok());
+        let memo_hex = sent_memo.map(hex::encode);
         let tx = DisplayedTransactionBuilder::new()
             .account_id(self.account.id)
             .direction(TransactionDirection::Outgoing)
@@ -1073,7 +1078,8 @@ impl TransactionSender {
             .lock_height(lock_height)
             .source(TransactionSource::OneSided)
             .credits_and_debits(credit, debit)
-            .message(recipient.payment_id.clone())
+            .message(message)
+            .memo_hex(memo_hex)
             .counterparty(Some(recipient.address.clone()))
             .blockchain_info(0, FixedHash::default(), now, 0) // No block height yet
             .fee(Some(fee))
@@ -2382,6 +2388,92 @@ mod tests {
         (sender, signed)
     }
 
+    /// An exchange deposit address embeds its reference as raw bytes, which need not be text.
+    /// The output must carry those exact bytes, whatever message the sender typed.
+    #[test]
+    fn an_address_payment_id_is_sent_as_its_bytes() {
+        let (pool, _temp) = setup_funded_wallet(3);
+        let mut sender = sender_for(&pool);
+        let embedded = vec![0x9c, 0xf1, 0x03, 0x00, 0xff, 0x80, 0x01, 0x00];
+        let deposit = TariAddress::new_dual_address_with_default_features(
+            CompressedPublicKey::from_secret_key(&PrivateKey::from(7u64)),
+            CompressedPublicKey::from_secret_key(&PrivateKey::from(9u64)),
+            Network::LocalNet,
+        )
+        .expect("address")
+        .with_memo_field_payment_id(embedded.clone())
+        .expect("payment id");
+        let recipient = Recipient {
+            address: deposit,
+            amount: MicroMinotari(1_000),
+            payment_id: Some("typed message".to_string()),
+        };
+        let prepared = sender
+            .start_new_transaction("binary-payment-id".to_string(), recipient, 300)
+            .expect("prepare");
+
+        assert_eq!(prepared.info.recipients[0].payment_id.payment_id_as_bytes(), embedded);
+        assert_eq!(prepared.info.payment_id.payment_id_as_bytes(), embedded);
+    }
+
+    /// The history row records the bytes that went on chain: the scan keeps this row, so a
+    /// typed message an address's embedded id replaced would otherwise show for good.
+    #[test]
+    fn the_pending_record_shows_the_payment_id_that_was_sent() {
+        let (pool, _temp) = setup_funded_wallet(3);
+        let sender = sender_for(&pool);
+        let address = TariAddress::new_dual_address_with_default_features(
+            CompressedPublicKey::from_secret_key(&PrivateKey::from(7u64)),
+            CompressedPublicKey::from_secret_key(&PrivateKey::from(9u64)),
+            Network::LocalNet,
+        )
+        .expect("address");
+        let signed = SignedTransaction {
+            transaction: tari_transaction_components::transaction_components::Transaction::new(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                tari_common_types::types::PrivateKey::default(),
+                tari_common_types::types::PrivateKey::default(),
+            ),
+            sent_hashes: Vec::new(),
+            outputs: Vec::new(),
+            change_hashes: Vec::new(),
+            change_output: None,
+            tx_id: TxId::new_random(),
+        };
+        let record = |address: TariAddress| {
+            let recipient = Recipient {
+                address,
+                amount: MicroMinotari(1_000),
+                payment_id: Some("typed message".to_string()),
+            };
+            let processed = ProcessedTransaction::new(None, "history".to_string(), vec![recipient], 300);
+            let tx = sender
+                .build_pending_displayed_transaction(&processed, &signed, MicroMinotari(10))
+                .expect("record");
+            (tx.message, tx.details.memo_hex)
+        };
+
+        let binary = vec![0x9c, 0xf1, 0x03, 0xff];
+        assert_eq!(
+            record(address.with_memo_field_payment_id(binary.clone()).expect("payment id")),
+            (None, Some(hex::encode(&binary)))
+        );
+        assert_eq!(
+            record(
+                address
+                    .with_memo_field_payment_id(b"DEP-42".to_vec())
+                    .expect("payment id")
+            ),
+            (Some("DEP-42".to_string()), Some(hex::encode(b"DEP-42")))
+        );
+        assert_eq!(
+            record(address),
+            (Some("typed message".to_string()), Some(hex::encode(b"typed message")))
+        );
+    }
+
     /// The recipient's output memo names the sender, so the recipient's wallet can show who paid
     /// it; the change memo stays the plain payment id.
     #[test]
@@ -2724,7 +2816,9 @@ mod tests {
             plain.public_spend_key().clone(),
             Network::LocalNet,
             TariAddressFeatures::create_one_sided_only(),
-            Some(vec![b'x'; 100]),
+            // An exchange-sized reference: the change memo carries it twice, in the address
+            // and as the payment id, so a much longer one cannot be sent at all.
+            Some(vec![b'x'; 32]),
         )
         .expect("address");
         let recipient = Recipient {
@@ -2788,6 +2882,16 @@ mod tests {
         sender
             .start_new_transaction_multi("long".to_string(), too_long, 300)
             .expect_err("a payment id too long for the change memo");
+
+        // So is an id embedded in the address that does not fit, whatever was typed.
+        let mut embedded = recipients(1);
+        embedded[0].address = embedded[0]
+            .address
+            .with_memo_field_payment_id(vec![0xff; 256])
+            .expect("payment id");
+        sender
+            .start_new_transaction_multi("embedded".to_string(), embedded, 300)
+            .expect_err("an embedded payment id too long for the memos");
 
         assert_eq!(pending_transaction_count(&pool), 0);
         assert_eq!(locked_output_count(&pool), 0);

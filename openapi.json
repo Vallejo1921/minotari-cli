@@ -1983,7 +1983,7 @@
               "string",
               "null"
             ],
-            "description": "Optional payment identifier for transaction tracking.\n\nThis can be used to associate the payment with an invoice, order, or\nother business reference. The payment ID is included in the transaction\nmetadata."
+            "description": "Optional payment identifier for transaction tracking.\n\nThis can be used to associate the payment with an invoice, order, or\nother business reference. The payment ID is included in the transaction\nmetadata, unless the address embeds a payment ID of its own: that one is\nsent instead, as the console wallet does."
           }
         }
       },

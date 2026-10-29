@@ -160,7 +160,8 @@ pub struct RecipientRequest {
     ///
     /// This can be used to associate the payment with an invoice, order, or
     /// other business reference. The payment ID is included in the transaction
-    /// metadata.
+    /// metadata, unless the address embeds a payment ID of its own: that one is
+    /// sent instead, as the console wallet does.
     payment_id: Option<String>,
 }
 
