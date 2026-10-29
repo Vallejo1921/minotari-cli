@@ -495,7 +495,7 @@ fn claim_burn_reservation(conn: &Connection, account_id: i64, idempotency_key: &
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         db::{SqlitePool, create_account, get_account_by_name, init_db},
@@ -619,7 +619,7 @@ mod tests {
 
     /// A funded account whose one UTXO is real: its keys live in the account's key manager, so
     /// the builder can sign it and the finished transaction can be checked the way a node would.
-    fn setup_funded_account(value: u64) -> (SqlitePool, AccountRow, tempfile::TempDir) {
+    pub(crate) fn setup_funded_account(value: u64) -> (SqlitePool, AccountRow, tempfile::TempDir) {
         use tari_transaction_components::test_helpers::{TestParams, create_wallet_output_with_data};
 
         let temp = tempdir().expect("temp dir");

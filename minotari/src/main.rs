@@ -72,10 +72,11 @@ use minotari::{
     scan::{self, reorg::rollback_from_height},
     signing,
     transactions::{
-        fee_estimator::estimated_output_size_for_payment_id,
         fund_locker::FundLocker,
         idempotency::{IdempotencyBinding, IdempotencyOperation, RequestFingerprint},
-        one_sided_transaction::{OneSidedTransaction, Recipient, unsigned_transaction_binding},
+        one_sided_transaction::{
+            OneSidedTransaction, Recipient, check_memos_and_estimate_output_size, unsigned_transaction_binding,
+        },
     },
     utils::{self, crypto::PasswordCipher},
     webhooks::WebhookTriggerConfig,
@@ -811,13 +812,8 @@ fn handle_create_unsigned_transaction(
     let fee_per_gram = MicroMinotari(5);
     // One size is charged for every output, so quote the largest memo in the batch rather than
     // the default: anything smaller reserves inputs that cannot pay the fee the builder lands on.
-    let estimated_output_size = Some(estimated_output_size_for_payment_id(
-        recipients
-            .iter()
-            .map(|r| r.payment_id.as_ref().map_or(0, String::len))
-            .max()
-            .unwrap_or(0),
-    )?);
+    let sender_address = account.get_address(network, &Zeroizing::new(password.clone()))?;
+    let estimated_output_size = Some(check_memos_and_estimate_output_size(&recipients, &sender_address)?);
 
     // Same binding the REST endpoint builds, so a key means the same thing
     // whichever way the request arrives.
