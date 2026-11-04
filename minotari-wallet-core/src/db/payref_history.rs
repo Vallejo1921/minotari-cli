@@ -1,5 +1,5 @@
 use crate::db::error::WalletDbResult;
-use log::{debug, warn};
+use log::{trace, warn};
 use rusqlite::{Connection, OptionalExtension, named_params};
 use tari_common_types::transaction::TxId;
 
@@ -16,7 +16,7 @@ pub fn save_payref_history(
     old_payref: &str,
     output_hash: Option<&str>,
 ) -> WalletDbResult<()> {
-    debug!(
+    trace!(
         account_id = account_id,
         transaction_id = transaction_id.to_string().as_str(),
         old_payref = old_payref;
@@ -46,7 +46,7 @@ pub fn get_transaction_id_by_historical_payref(
     account_id: i64,
     payref: &str,
 ) -> WalletDbResult<Option<TxId>> {
-    debug!(
+    trace!(
         account_id = account_id,
         payref = payref;
         "DB: Looking up historical payref"
@@ -86,7 +86,7 @@ pub fn save_displayed_transaction_payrefs_before_reorg(
     warn!(
         account_id = account_id,
         height = reorg_height;
-        "DB: Saving displayed transaction payrefs before reorg"
+        "DB: Saving displayed transaction payment references before reorg"
     );
 
     #[allow(clippy::cast_possible_wrap)]
@@ -118,9 +118,8 @@ pub fn save_displayed_transaction_payrefs_before_reorg(
             Ok(id) => id,
             Err(e) => {
                 warn!(
-                    id = tx_id_str.as_str(),
                     error = e.to_string().as_str();
-                    "DB: Skipping displayed tx with unparsable id while saving payref history"
+                    "DB: Skipping displayed tx with unparsable id while saving payment reference history"
                 );
                 continue;
             },
@@ -149,7 +148,7 @@ pub fn save_completed_transaction_payrefs_before_reorg(
     warn!(
         account_id = account_id,
         height = reorg_height;
-        "DB: Saving completed transaction payrefs before reorg"
+        "DB: Saving completed transaction payment references before reorg"
     );
 
     #[allow(clippy::cast_possible_wrap)]

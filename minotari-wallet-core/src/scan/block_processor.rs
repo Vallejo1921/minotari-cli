@@ -5,7 +5,7 @@
 //! manage confirmation status, and emit events for each processed block.
 
 use chrono::{DateTime, Utc};
-use log::{error, info, warn};
+use log::{error, info, trace, warn};
 use minotari_scanning::BlockScanResult;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
@@ -623,8 +623,12 @@ impl<E: EventSender> BlockProcessor<E> {
     ) -> Result<(i64, WalletEvent), BlockProcessorError> {
         info!(
             target: "audit",
-            id = completed_tx_id.to_string().as_str(),
             height = height;
+            "Transaction the monitor rejected was mined after all (its change is in a block)"
+        );
+        trace!(
+            target: "audit",
+            id = completed_tx_id.to_string().as_str();
             "Transaction the monitor rejected was mined after all (its change is in a block)"
         );
         #[allow(clippy::cast_possible_wrap)]
@@ -713,9 +717,13 @@ impl<E: EventSender> BlockProcessor<E> {
             info!(
                 target: "audit",
                 account_id = account_id,
-                tx_id:% = tx_id,
                 block_height = block.height,
                 value = &*mask_amount(output.value());
+                "Detected spent input"
+            );
+            trace!(
+                target: "audit",
+                tx_id:% = tx_id;
                 "Detected spent input"
             );
 
@@ -833,7 +841,6 @@ impl<E: EventSender> BlockProcessor<E> {
                 Err(e) => {
                     warn!(
                         target: "audit",
-                        id = completed.id.to_string().as_str(),
                         error:% = e;
                         "Cannot decode stored transaction; not matching it against this block"
                     );
@@ -864,8 +871,12 @@ impl<E: EventSender> BlockProcessor<E> {
             if all_inputs_in_block && change_in_block {
                 info!(
                     target: "audit",
-                    id = completed.id.to_string().as_str(),
                     height = send_block.height;
+                    "Transaction mined (unconfirmed)"
+                );
+                trace!(
+                    target: "audit",
+                    id = completed.id.to_string().as_str();
                     "Transaction mined (unconfirmed)"
                 );
                 db::mark_completed_transaction_as_mined_unconfirmed(
@@ -894,7 +905,8 @@ impl<E: EventSender> BlockProcessor<E> {
                 generated_events.push((event_id, event));
 
                 if was_rejected {
-                    info!(
+                    info!(target: "audit", "Transaction the monitor rejected was mined after all");
+                    trace!(
                         target: "audit",
                         id = completed.id.to_string().as_str();
                         "Transaction the monitor rejected was mined after all"
@@ -906,7 +918,6 @@ impl<E: EventSender> BlockProcessor<E> {
             if !block_is_complete {
                 warn!(
                     target: "audit",
-                    id = completed.id.to_string().as_str(),
                     height = send_block.height,
                     all_inputs_in_block = all_inputs_in_block,
                     change_in_block = change_in_block;
@@ -947,7 +958,6 @@ impl<E: EventSender> BlockProcessor<E> {
             let reason = "inputs spent by a different transaction".to_string();
             warn!(
                 target: "audit",
-                id = completed.id.to_string().as_str(),
                 height = send_block.height,
                 all_inputs_in_block = all_inputs_in_block,
                 change_in_block = change_in_block;
@@ -1079,9 +1089,13 @@ impl<E: EventSender> BlockProcessor<E> {
             info!(
                 target: "audit",
                 account_id = account_id,
-                output_hash = &*mask_string(&hex::encode(unconfirmed_output.output_hash)),
                 original_height = unconfirmed_output.mined_in_block_height,
                 confirmed_at = block.height;
+                "Output confirmed"
+            );
+            trace!(
+                target: "audit",
+                output_hash = &*mask_string(&hex::encode(unconfirmed_output.output_hash));
                 "Output confirmed"
             );
 
@@ -1110,7 +1124,8 @@ impl<E: EventSender> BlockProcessor<E> {
             if unconfirmed_output.is_burn != 0 {
                 match get_burn_proof_by_output_hash(tx, &unconfirmed_output.output_hash) {
                     Ok(Some(_proof)) => {
-                        info!(
+                        info!(target: "audit", "Burn output confirmed — daemon will fetch burn output proof");
+                        trace!(
                             target: "audit",
                             output_hash = &*mask_string(&hex::encode(unconfirmed_output.output_hash));
                             "Burn output confirmed — daemon will fetch burn output proof"
@@ -1121,7 +1136,6 @@ impl<E: EventSender> BlockProcessor<E> {
                     },
                     Err(e) => {
                         error!(
-                            output_hash = &*mask_string(&hex::encode(unconfirmed_output.output_hash)),
                             error:% = e;
                             "Failed to look up burn proof for confirmed burn output"
                         );

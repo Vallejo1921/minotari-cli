@@ -4,7 +4,7 @@ use axum::{
     Json,
     extract::{Path, State},
 };
-use log::info;
+use log::{info, trace};
 use serde::{Deserialize, Serialize};
 use tari_common_types::transaction::TxId;
 use utoipa::IntoParams;
@@ -128,8 +128,12 @@ pub async fn api_abandon_send(
 
     info!(
         target: "audit",
-        tx_id = tx_id.to_string().as_str(),
         reconcilable = abandoned.reconcilable;
+        "API: Send abandoned"
+    );
+    trace!(
+        target: "audit",
+        tx_id = tx_id.to_string().as_str();
         "API: Send abandoned"
     );
 

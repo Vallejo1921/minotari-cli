@@ -40,6 +40,9 @@
 
 use std::time::Duration;
 
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
 use crate::models::Id;
 use crate::transactions::DisplayedTransaction;
 use tari_common_types::types::FixedHash;
@@ -140,19 +143,28 @@ pub enum ScanStatusEvent {
         account_id: i64,
         last_scanned_height: u64,
     },
+    /// Terminal: the scan reached its target (the chain tip, or a backfill's end height).
     Completed {
         account_id: i64,
         final_height: u64,
         total_blocks_scanned: u64,
     },
+    /// The scan is caught up and waits `resume_in` before the next poll (Continuous mode).
     Waiting {
         account_id: i64,
         resume_in: Duration,
     },
-    Paused {
+    /// Terminal: the cancel token fired. The next run resumes after `last_scanned_height`.
+    Cancelled {
         account_id: i64,
         last_scanned_height: u64,
-        reason: PauseReason,
+    },
+    /// Terminal: the deadline passed or `max_blocks` were scanned before reaching `tip_height`.
+    /// The next run resumes after `last_scanned_height`.
+    BudgetExhausted {
+        account_id: i64,
+        last_scanned_height: u64,
+        tip_height: u64,
     },
     FastSyncPhaseStarted {
         account_id: i64,
@@ -164,12 +176,6 @@ pub enum ScanStatusEvent {
         account_id: i64,
         phase: FastSyncPhase,
     },
-}
-
-#[derive(Debug, Clone)]
-pub enum PauseReason {
-    MaxBlocksReached { limit: u64 },
-    Cancelled,
 }
 
 /// Identifies which phase of a fast sync operation is active.
@@ -221,5 +227,74 @@ impl ChannelEventSender {
 impl EventSender for ChannelEventSender {
     fn send(&self, event: ProcessingEvent) -> bool {
         self.sender.send(event).is_ok()
+    }
+}
+
+/// Where a scan sends its events.
+#[derive(Debug, Clone)]
+pub(crate) enum EventChannel {
+    None,
+    Unbounded(mpsc::UnboundedSender<ProcessingEvent>),
+    /// Waits for room in the channel until `cancel` fires; after that an event
+    /// that does not fit is dropped. Terminal and reorg events still wait for
+    /// room after a cancel (see [`EventChannel::send_always`]), so the consumer
+    /// must keep reading or drop the receiver for a cancelled scan to finish.
+    Bounded {
+        sender: mpsc::Sender<ProcessingEvent>,
+        cancel: Option<CancellationToken>,
+    },
+}
+
+impl EventChannel {
+    pub(crate) async fn send(&self, event: ProcessingEvent) {
+        match self {
+            EventChannel::None => {},
+            EventChannel::Unbounded(sender) => {
+                let _unused = sender.send(event);
+            },
+            EventChannel::Bounded { sender, cancel } => {
+                let permit = match cancel {
+                    Some(token) => tokio::select! {
+                        permit = sender.reserve() => permit.ok(),
+                        () = token.cancelled() => sender.try_reserve().ok(),
+                    },
+                    None => sender.reserve().await.ok(),
+                };
+                if let Some(permit) = permit {
+                    permit.send(event);
+                }
+            },
+        }
+    }
+
+    /// Sends an event that must reach the consumer (a terminal event, a reorg):
+    /// it waits for room even after a cancel, and is lost only if the receiver is gone.
+    pub(crate) async fn send_always(&self, event: ProcessingEvent) {
+        match self {
+            EventChannel::None => {},
+            EventChannel::Unbounded(sender) => {
+                let _unused = sender.send(event);
+            },
+            EventChannel::Bounded { sender, .. } => {
+                let _unused = sender.send(event).await;
+            },
+        }
+    }
+}
+
+/// Receives the events of a scan started with [`Scanner::run_with_events`](crate::scan::Scanner::run_with_events).
+#[derive(Debug)]
+pub enum EventReceiver {
+    Unbounded(mpsc::UnboundedReceiver<ProcessingEvent>),
+    Bounded(mpsc::Receiver<ProcessingEvent>),
+}
+
+impl EventReceiver {
+    /// Receives the next event, or `None` once the scan has finished and every event was read.
+    pub async fn recv(&mut self) -> Option<ProcessingEvent> {
+        match self {
+            EventReceiver::Unbounded(receiver) => receiver.recv().await,
+            EventReceiver::Bounded(receiver) => receiver.recv().await,
+        }
     }
 }

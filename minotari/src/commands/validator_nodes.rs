@@ -19,7 +19,7 @@ use crate::{
     },
 };
 use anyhow::anyhow;
-use log::info;
+use log::{info, trace};
 use rusqlite::Connection;
 use tari_common::configuration::Network;
 use tari_common_types::{
@@ -240,7 +240,12 @@ async fn sign_save_and_broadcast(
     // (the monitor rebroadcasts it), so this succeeds either way.
     let first_broadcast = record_first_broadcast(Some(conn), completed_tx_id, response);
     if first_broadcast.accepted_by_node {
-        info!(target: "audit", tx_id = completed_tx_id.to_string().as_str(); "{} broadcasted", tx_kind);
+        info!(target: "audit", "{} broadcasted", tx_kind);
+        trace!(
+            target: "audit",
+            tx_id = completed_tx_id.to_string().as_str();
+            "{} broadcasted", tx_kind
+        );
         println!("{} transaction broadcasted. tx_id={}", tx_kind, completed_tx_id);
         if let Some(note) = first_broadcast.note() {
             println!("{note}");

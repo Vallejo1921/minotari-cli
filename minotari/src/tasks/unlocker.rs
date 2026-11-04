@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use log::{error, info};
+use log::{error, info, trace};
 use rusqlite::Connection;
 use tokio::{sync::broadcast, task::JoinHandle, time::interval};
 
@@ -24,9 +24,15 @@ impl TransactionUnlocker {
 
         for tx in expired_txs {
             if Self::expire_and_unlock(conn, &tx.id)? {
-                info!(target: "audit", id = &*tx.id; "Transaction expired: unlocked funds");
+                info!(target: "audit", "Transaction expired: unlocked funds");
+                trace!(
+                    target: "audit",
+                    id = &*tx.id;
+                    "Transaction expired: unlocked funds"
+                );
             } else {
-                info!(
+                info!(target: "audit", "Transaction was claimed after it was listed as expired; leaving its funds locked");
+                trace!(
                     target: "audit",
                     id = &*tx.id;
                     "Transaction was claimed after it was listed as expired; leaving its funds locked"

@@ -2,8 +2,7 @@
 
 use std::path::PathBuf;
 
-use log::{info, warn};
-use tokio::sync::mpsc;
+use log::{info, trace, warn};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
@@ -11,7 +10,7 @@ use crate::{
     WalletEvent,
     config::defaults::WalletConfig,
     db::{self, WalletDbError, init_db},
-    scan::{ProcessingEvent, ScanError, ScanMode, Scanner, reorg::rollback_from_height},
+    scan::{EventReceiver, ScanError, ScanMode, Scanner, reorg::rollback_from_height},
     webhooks::WebhookTriggerConfig,
 };
 
@@ -63,7 +62,7 @@ pub async fn rescan_with_events(
     cancel_token: Option<CancellationToken>,
 ) -> Result<
     (
-        mpsc::UnboundedReceiver<ProcessingEvent>,
+        EventReceiver,
         impl Future<Output = Result<(Vec<WalletEvent>, bool), ScanError>> + use<>,
     ),
     ScanError,
@@ -159,8 +158,12 @@ pub async fn rollback_account_to_height(
 
         info!(
             target: "audit",
-            account = &*account_name,
             from_height = from_height;
+            "Rolling account back for a rescan"
+        );
+        trace!(
+            target: "audit",
+            account = &*account_name;
             "Rolling account back for a rescan"
         );
         let info = rollback_from_height(&tx, account.id, from_height, webhook_config)
@@ -189,7 +192,7 @@ pub async fn rollback_account_to_height(
 mod tests {
     use super::*;
     use crate::db::{create_account, get_account_by_name};
-    use crate::scan::ScanStatusEvent;
+    use crate::scan::{ProcessingEvent, ScanStatusEvent};
     use std::time::Duration;
     use tari_common_types::seeds::cipher_seed::CipherSeed;
     use tari_script::script;

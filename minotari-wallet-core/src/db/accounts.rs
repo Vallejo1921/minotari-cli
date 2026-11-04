@@ -1,4 +1,4 @@
-use log::{debug, info, warn};
+use log::{debug, info, trace, warn};
 use rusqlite::{Connection, named_params};
 use serde::{Deserialize, Serialize};
 use serde_rusqlite::from_rows;
@@ -43,7 +43,8 @@ pub fn create_account(
     wallet: &WalletType,
     password: &str,
 ) -> WalletDbResult<()> {
-    info!(
+    info!(target: "audit", "DB: Creating new account");
+    trace!(
         target: "audit",
         account = friendly_name;
         "DB: Creating new account"
@@ -93,7 +94,7 @@ pub fn create_account(
 }
 
 pub fn get_account_by_name(conn: &Connection, friendly_name: &str) -> WalletDbResult<Option<AccountRow>> {
-    debug!(
+    trace!(
         account = friendly_name;
         "DB: Fetching account by name"
     );
@@ -120,7 +121,7 @@ pub fn get_account_by_name(conn: &Connection, friendly_name: &str) -> WalletDbRe
 
 pub fn get_accounts(conn: &Connection, friendly_name: Option<&str>) -> WalletDbResult<Vec<AccountRow>> {
     if let Some(name) = friendly_name {
-        debug!(
+        trace!(
             account = name;
             "DB: Listing accounts with filter"
         );
@@ -218,7 +219,8 @@ impl AccountRow {
     pub(crate) fn decrypt_wallet_json(&self, password: &str) -> WalletDbResult<Zeroizing<Vec<u8>>> {
         // Malformed rows fail here, so `DecryptionFailed` below means a wrong password or tampering.
         if self.cipher_nonce.len() != 24 || self.salt.len() < argon2::MIN_SALT_LEN {
-            warn!(account = &*self.friendly_name; "DB: Stored wallet nonce or salt is malformed");
+            warn!("DB: Stored wallet nonce or salt is malformed");
+            trace!(account = &*self.friendly_name; "DB: Stored wallet nonce or salt is malformed");
             return Err(WalletDbError::Decoding(
                 "Stored wallet nonce or salt is malformed".to_string(),
             ));
@@ -274,13 +276,11 @@ impl AccountRow {
         if expected != self.fingerprint {
             warn!(
                 target: "audit",
-                account = &*self.friendly_name;
                 "DB: Wallet fingerprint mismatch — stored key material does not belong to this account"
             );
-            return Err(WalletDbError::DecryptionFailed(format!(
-                "Wallet fingerprint mismatch for account '{}': the stored key material does not belong to this account",
-                self.friendly_name
-            )));
+            return Err(WalletDbError::DecryptionFailed(
+                "Wallet fingerprint mismatch: the stored key material does not belong to this account".to_string(),
+            ));
         }
 
         Ok(())
@@ -471,7 +471,8 @@ fn get_balance_in_snapshot(conn: &Connection, account_id: i64) -> WalletDbResult
 /// Deletes the account row and its data. Does not touch its key session; use
 /// [`crate::utils::delete_wallet::delete_wallet`], which also locks it.
 pub(crate) fn delete_account(conn: &Connection, friendly_name: &str) -> WalletDbResult<()> {
-    info!(
+    info!(target: "audit", "DB: Deleting account and all associated data");
+    trace!(
         target: "audit",
         account = friendly_name;
         "DB: Deleting account and all associated data"
@@ -527,7 +528,12 @@ pub(crate) fn delete_account(conn: &Connection, friendly_name: &str) -> WalletDb
         )));
     }
 
-    info!(target: "audit", account = friendly_name; "Account successfully deleted");
+    info!(target: "audit", "Account successfully deleted");
+    trace!(
+        target: "audit",
+        account = friendly_name;
+        "Account successfully deleted"
+    );
 
     Ok(())
 }
@@ -535,7 +541,8 @@ pub(crate) fn delete_account(conn: &Connection, friendly_name: &str) -> WalletDb
 /// Renames the account row. Does not touch its key session; use
 /// [`crate::utils::rename_wallet::rename_wallet`], which also locks it.
 pub(crate) fn update_account_name(conn: &Connection, current_name: &str, new_name: &str) -> WalletDbResult<()> {
-    info!(
+    info!(target: "audit", "DB: Renaming account");
+    trace!(
         target: "audit",
         current_name = current_name,
         new_name = new_name;
@@ -594,7 +601,8 @@ pub fn change_passphrase(
     old_password: &str,
     new_password: &str,
 ) -> WalletDbResult<()> {
-    info!(
+    info!(target: "audit", "DB: Changing account passphrase");
+    trace!(
         target: "audit",
         account = account_name;
         "DB: Changing account passphrase"
@@ -654,7 +662,8 @@ fn rewrite_encrypted_wallet(
     )?;
     tx.commit()?;
 
-    info!(
+    info!(target: "audit", "DB: Account passphrase changed");
+    trace!(
         target: "audit",
         account = account_name;
         "DB: Account passphrase changed"

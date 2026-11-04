@@ -221,13 +221,13 @@ pub fn rollback_from_height(
     db::delete_scanned_tip_blocks_from_height(tx, account_id, reorg_start_height)?;
 
     // Save displayed transaction payrefs to history before they get overwritten on re-mine
-    let saved_displayed_payrefs =
+    let saved_displayed_references =
         db::save_displayed_transaction_payrefs_before_reorg(tx, account_id, reorg_start_height)?;
-    if saved_displayed_payrefs > 0 {
+    if saved_displayed_references > 0 {
         info!(
             target: "audit",
-            count = saved_displayed_payrefs;
-            "Saved displayed transaction payref(s) to history before reorg"
+            count = saved_displayed_references;
+            "Saved displayed transaction payment references to history before reorg"
         );
     }
 
@@ -235,12 +235,12 @@ pub fn rollback_from_height(
         db::mark_displayed_transactions_reorganized_and_return(tx, account_id, reorg_start_height)?;
 
     // Save old payrefs to history before they are cleared by the reset
-    let saved_payrefs = db::save_completed_transaction_payrefs_before_reorg(tx, account_id, reorg_start_height)?;
-    if saved_payrefs > 0 {
+    let saved_references = db::save_completed_transaction_payrefs_before_reorg(tx, account_id, reorg_start_height)?;
+    if saved_references > 0 {
         info!(
             target: "audit",
-            count = saved_payrefs;
-            "Saved payref(s) to history before reorg reset"
+            count = saved_references;
+            "Saved payment references to history before reorg reset"
         );
     }
 
@@ -269,7 +269,6 @@ pub fn rollback_from_height(
         if !revived {
             warn!(
                 target: "audit",
-                id = completed_tx_id.to_string().as_str();
                 "Reorg removed the block a send was rejected in, but its inputs are no longer its own; keeping it rejected"
             );
             db::keep_rejected_after_reorg(

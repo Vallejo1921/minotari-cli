@@ -40,7 +40,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use log::{error, warn};
+use log::{error, trace, warn};
 use serde_json::json;
 use thiserror::Error;
 use utoipa::ToSchema;
@@ -306,42 +306,44 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, error_message) = match &self {
             ApiError::InternalServerError(msg) => {
-                error!(error = msg.as_str(); "API: Internal Server Error");
+                error!("API: Internal Server Error");
                 (StatusCode::INTERNAL_SERVER_ERROR, msg.clone())
             },
             ApiError::DbError(e) => {
-                error!(error = e.as_str(); "API: Database Error");
+                error!("API: Database Error");
                 (StatusCode::INTERNAL_SERVER_ERROR, e.clone())
             },
             ApiError::AccountNotFound(name) => {
-                warn!(account = name.as_str(); "API: Account Not Found");
+                warn!("API: Account Not Found");
                 (StatusCode::NOT_FOUND, format!("Account '{}' not found", name))
             },
             ApiError::NotFound(msg) => {
-                warn!(message = msg.as_str(); "API: Not Found");
+                warn!("API: Not Found");
                 (StatusCode::NOT_FOUND, msg.clone())
             },
             ApiError::BadRequest(msg) => {
-                warn!(message = msg.as_str(); "API: Bad Request");
+                warn!("API: Bad Request");
                 (StatusCode::BAD_REQUEST, msg.clone())
             },
             ApiError::Conflict(msg) => {
-                warn!(target: "audit", message = msg.as_str(); "API: Conflict");
+                warn!(target: "audit", "API: Conflict");
                 (StatusCode::CONFLICT, msg.clone())
             },
             ApiError::FailedToLockFunds(e) => {
-                error!(target: "audit", error = e.as_str(); "API: Failed to lock funds");
+                error!(target: "audit", "API: Failed to lock funds");
                 (StatusCode::INTERNAL_SERVER_ERROR, e.clone())
             },
             ApiError::FailedCreateUnsignedTx(e) => {
-                error!(target: "audit", error = e.as_str(); "API: Failed to create unsigned transaction");
+                error!(target: "audit", "API: Failed to create unsigned transaction");
                 (StatusCode::INTERNAL_SERVER_ERROR, e.clone())
             },
             ApiError::FailedToBurnFunds(e) => {
-                error!(target: "audit", error = e.as_str(); "API: Failed to burn funds");
+                error!(target: "audit", "API: Failed to burn funds");
                 (StatusCode::INTERNAL_SERVER_ERROR, e.clone())
             },
         };
+        // Messages can name a wallet, payment reference or transaction; only the kind is logged above.
+        trace!(message = error_message.as_str(); "API: Error message");
 
         let body = Json(json!({
             "error": error_message,

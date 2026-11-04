@@ -28,6 +28,6 @@ pub mod webhooks;
 pub use crate::db::{get_accounts, get_balance, init_db};
 pub use crate::models::WalletEvent;
 pub use crate::scan::types::ScanError;
-pub use crate::scan::{BlockProcessedEvent, PauseReason, ProcessingEvent, ScanMode, ScanStatusEvent, Scanner};
+pub use crate::scan::{BlockProcessedEvent, EventReceiver, ProcessingEvent, ScanMode, ScanStatusEvent, Scanner};
 pub use crate::signing::{SigningError, sign_message, sign_message_unlocked, sign_message_with_seed, verify_message};
 pub use crate::transactions::{DisplayedTransaction, TransactionHistoryService};

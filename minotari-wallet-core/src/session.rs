@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, RwLock};
 
-use log::info;
+use log::{info, trace};
 use rusqlite::Connection;
 use tari_transaction_components::key_manager::wallet_types::WalletType;
 
@@ -107,7 +107,8 @@ pub fn unlock(conn: &Connection, account_name: &str, passphrase: &str) -> Wallet
         return Err(WalletDbError::NotUnlocked(account_name.to_string()));
     }
     store(&account, wallet);
-    info!(target: "audit", account = account_name; "Key session unlocked");
+    info!(target: "audit", "Key session unlocked");
+    trace!(target: "audit", account = account_name; "Key session unlocked");
     Ok(())
 }
 
@@ -125,7 +126,8 @@ fn decrypt_for_unlock(
     let wallet_json = match account.decrypt_wallet_json(passphrase) {
         Ok(wallet_json) => wallet_json,
         Err(WalletDbError::DecryptionFailed(_)) => {
-            info!(target: "audit", account = account_name; "Key session unlock failed: wrong passphrase");
+            info!(target: "audit", "Key session unlock failed: wrong passphrase");
+            trace!(target: "audit", account = account_name; "Key session unlock failed: wrong passphrase");
             return Err(WalletDbError::InvalidPassphrase);
         },
         Err(e) => return Err(e),
@@ -144,7 +146,8 @@ pub fn lock(account_name: &str) {
     let mut changes = changes_guard();
     changes.record_lock(account_name);
     if take(account_name).is_some() {
-        info!(target: "audit", account = account_name; "Key session locked");
+        info!(target: "audit", "Key session locked");
+        trace!(target: "audit", account = account_name; "Key session locked");
     }
 }
 
@@ -205,7 +208,8 @@ pub(crate) fn has_session(account: &AccountRow) -> bool {
 pub(crate) fn remove_session_for(account: &AccountRow) {
     let account_name = &*account.friendly_name;
     if has_session(account) && take(account_name).is_some() {
-        info!(target: "audit", account = account_name; "Key session locked");
+        info!(target: "audit", "Key session locked");
+        trace!(target: "audit", account = account_name; "Key session locked");
     }
 }
 
@@ -579,13 +583,18 @@ mod tests {
     #[test]
     fn this_module_only_logs_account_names_to_audit() {
         // Key material must never reach a log line. The only log lines allowed here are
-        // one-line audit messages whose only field is the account name.
+        // one-line audit messages: at info with no field, or at trace naming the account.
         let source = include_str!("session.rs");
-        let audit = format!("{}!(target: \"audit\"", "info");
-        let allowed_fields = [audit.clone(), format!("{audit}, account = account_name")];
+        let info_audit = format!("{}!(target: \"audit\"", "info");
+        let trace_audit = format!("{}!(target: \"audit\"", "trace");
+        let allowed_fields = [info_audit, format!("{trace_audit}, account = account_name")];
         for line in source.lines().map(str::trim) {
             if line.contains(&format!("{}::", "log")) {
-                assert_eq!(line, format!("use {}::info;", "log"), "unexpected log import");
+                assert_eq!(
+                    line,
+                    format!("use {}::{{info, trace}};", "log"),
+                    "unexpected log import"
+                );
             }
             for name in ["trace", "debug", "info", "warn", "error"] {
                 if !line.contains(&format!("{name}!(")) {

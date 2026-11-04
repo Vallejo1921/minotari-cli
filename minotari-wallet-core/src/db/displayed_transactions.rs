@@ -3,7 +3,7 @@ use crate::log::mask_amount;
 use crate::models::Id;
 use crate::transactions::{DisplayedTransaction, TransactionDisplayStatus};
 use crate::utils::timestamp::{current_db_timestamp, format_timestamp};
-use log::{debug, info, warn};
+use log::{debug, info, trace, warn};
 use rusqlite::{Connection, OptionalExtension, named_params};
 use serde::Deserialize;
 use serde_rusqlite::from_rows;
@@ -64,7 +64,7 @@ fn process_json_rows(
 
 pub fn insert_displayed_transaction(conn: &Connection, transaction: &DisplayedTransaction) -> WalletDbResult<()> {
     let id = transaction.id.to_string();
-    debug!(
+    trace!(
         id = id.as_str(),
         amount = &*mask_amount(transaction.amount),
         status:? = transaction.status;
@@ -189,7 +189,7 @@ pub fn update_displayed_transaction_status(
     new_status: TransactionDisplayStatus,
     updated_transaction: &DisplayedTransaction,
 ) -> WalletDbResult<bool> {
-    debug!(
+    trace!(
         id = id,
         new_status:? = new_status;
         "DB: Updating displayed transaction status"
@@ -328,8 +328,12 @@ pub fn update_displayed_transaction_mined(conn: &Connection, tx: &DisplayedTrans
     let id = tx.id.to_string();
     info!(
         target: "audit",
-        id = id.as_str(),
         height = tx.blockchain.block_height;
+        "DB: Displayed Transaction Mined"
+    );
+    trace!(
+        target: "audit",
+        id = id.as_str();
         "DB: Displayed Transaction Mined"
     );
 
@@ -446,7 +450,6 @@ pub fn mark_displayed_transaction_rejected(
 ) -> WalletDbResult<Option<DisplayedTransaction>> {
     warn!(
         target: "audit",
-        id = tx_id.to_string().as_str();
         "DB: Marking displayed transaction as rejected"
     );
 
@@ -628,7 +631,7 @@ pub fn get_displayed_transactions_by_payref(
     account_id: Id,
     payref: &str,
 ) -> WalletDbResult<Vec<DisplayedTransaction>> {
-    debug!(
+    trace!(
         account_id = account_id,
         payref = payref;
         "DB: Fetching displayed transactions by payref"

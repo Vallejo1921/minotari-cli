@@ -212,7 +212,6 @@ pub fn abandon_send(
 
     warn!(
         target: "audit",
-        id = tx_id.to_string().as_str(),
         reconcilable = reconcilable;
         "Send abandoned by user; its inputs are released"
     );

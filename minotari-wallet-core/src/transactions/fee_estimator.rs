@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use log::debug;
+use log::trace;
 use tari_common::configuration::Network;
 use tari_common_types::{
     tari_address::{MAX_PAYMENT_ID_SIZE, TariAddress},
@@ -141,7 +141,7 @@ impl FeeEstimator {
         })
         .collect::<Result<Vec<_>>>()?;
 
-        debug!(
+        trace!(
             account = account_name,
             inputs = input_count;
             "Calculated fee estimates"

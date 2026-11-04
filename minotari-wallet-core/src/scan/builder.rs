@@ -1,14 +1,18 @@
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    ProcessingEvent, ScanMode, WalletEvent, db,
+    ScanMode, WalletEvent, db,
     scan::{
-        ChannelEventSender, EventSender, NoopEventSender,
+        EventReceiver,
         config::{DEFAULT_SCANNING_OFFSET_DAYS, OPTIMAL_SCANNING_THREADS, ScanRetryConfig, ScanTimeoutConfig},
         coordinator::ScanCoordinator,
+        events::EventChannel,
         types::ScanError,
     },
     webhooks::WebhookTriggerConfig,
@@ -23,7 +27,7 @@ use zeroize::Zeroizing;
 /// # Example
 ///
 /// ```rust,ignore
-/// use std::time::Duration;
+/// use std::time::{Duration, Instant};
 /// use crate::scan::{Scanner, ScanMode};
 /// use tokio_util::sync::CancellationToken;
 ///
@@ -34,7 +38,9 @@ use zeroize::Zeroizing;
 ///     .mode(ScanMode::Continuous {
 ///         poll_interval: Duration::from_secs(30),
 ///     })
-///     .processing_threads(4)
+///     .processing_threads(1)
+///     .event_buffer(Some(256))
+///     .deadline(Instant::now() + Duration::from_secs(240))
 ///     .reorg_check_interval(500)
 ///     .scan_timeout(Duration::from_secs(300))
 ///     .max_timeout_retries(5)
@@ -62,8 +68,12 @@ pub struct Scanner {
     account_name: Option<String>,
     /// Number of blocks to fetch per scan batch.
     batch_size: u64,
-    /// Number of parallel threads for output detection.
+    /// Number of parallel threads for output detection; 0 picks one per CPU, less two.
     processing_threads: usize,
+    /// Size of the event channel; `None` is unbounded.
+    event_buffer: Option<usize>,
+    /// The scan stops at the first batch boundary after this instant.
+    deadline: Option<Instant>,
     /// Number of days to offset birthday scanning by.
     scanning_offset: u64,
     /// Number of blocks between periodic reorg checks.
@@ -93,7 +103,9 @@ impl Scanner {
     ///
     /// # Defaults
     ///
-    /// - Processing threads: 8
+    /// - Processing threads: one per CPU, less two (at least one)
+    /// - Event channel: unbounded
+    /// - Deadline: none
     /// - Reorg check interval: 1000 blocks
     /// - Mode: [`ScanMode::Full`]
     /// - Retry config: Default values
@@ -117,6 +129,8 @@ impl Scanner {
             account_name: None,
             batch_size,
             processing_threads: OPTIMAL_SCANNING_THREADS,
+            event_buffer: None,
+            deadline: None,
             scanning_offset: DEFAULT_SCANNING_OFFSET_DAYS,
             reorg_check_interval: 1000,
             mode: ScanMode::Full,
@@ -148,16 +162,48 @@ impl Scanner {
         self
     }
 
-    /// Sets the number of parallel threads for output detection.
+    /// Sets the number of threads in the scan's output detection pool.
     ///
-    /// Higher values can improve scan speed but increase CPU usage.
-    /// Recommended range: 4-16 threads depending on hardware.
+    /// Higher values can improve scan speed but increase CPU usage. `0` (the
+    /// default) uses one thread per CPU, less two, and at least one. Use `1`
+    /// to keep a background scan light.
     ///
     /// # Arguments
     ///
     /// * `threads` - Number of parallel processing threads
     pub fn processing_threads(mut self, threads: usize) -> Self {
         self.processing_threads = threads;
+        self
+    }
+
+    /// Sets the size of the event channel returned by [`run_with_events`](Self::run_with_events).
+    ///
+    /// `Some(n)` holds at most `n` events: when it is full the scan waits for
+    /// the consumer, so a slow consumer slows the scan instead of growing
+    /// memory. Cancelling stops the wait; events that do not fit after a cancel
+    /// are dropped, except the terminal event and `ReorgDetected`, which still
+    /// wait for room: after a cancel the consumer must keep reading (or drop the
+    /// receiver) for the scan to finish. `None` (the default) is unbounded.
+    pub fn event_buffer(mut self, size: Option<usize>) -> Self {
+        self.event_buffer = size;
+        self
+    }
+
+    /// Stops the scan at the first batch boundary after `deadline`.
+    ///
+    /// The deadline is checked between batches: it does not interrupt a block
+    /// download, a node request or a wait for room in a bounded event channel
+    /// that is already in progress, so a scan can run past it by that much.
+    ///
+    /// The scan then ends with [`ScanStatusEvent::BudgetExhausted`](crate::ScanStatusEvent::BudgetExhausted)
+    /// (or `Completed` if a Full or Partial scan had reached the tip) and the
+    /// next run resumes from the last scanned height. A history backfill
+    /// ([`run_backfill`](Self::run_backfill)) is the exception: it always
+    /// restarts from the birthday, so a deadline shorter than the whole
+    /// backfill makes no lasting progress. It can be combined with
+    /// [`ScanMode::Partial`]: the scan stops at whichever limit comes first.
+    pub fn deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
         self
     }
 
@@ -267,18 +313,15 @@ impl Scanner {
         self
     }
 
-    async fn run_internal<E: EventSender + Clone + Send + 'static>(
-        self,
-        event_sender: E,
-    ) -> Result<(Vec<WalletEvent>, bool), ScanError> {
+    async fn run_internal(self, events: EventChannel) -> Result<(Vec<WalletEvent>, bool), ScanError> {
         let pool = db::init_db(self.database_file.clone())?;
         let conn = pool.get().map_err(|e| ScanError::DbError(e.into()))?;
 
-        let accounts = db::get_accounts(&conn, self.account_name.as_deref())?;
+        let accounts = accounts_to_scan(&conn, self.account_name.as_deref())?;
         let coordinator = ScanCoordinator::new(
             pool,
             self.base_url,
-            event_sender,
+            events,
             self.retry_config,
             self.required_confirmations,
             self.webhook_config,
@@ -286,7 +329,8 @@ impl Scanner {
             self.reorg_check_interval,
             self.batch_size,
         )?
-        .with_burn_proofs_dir(self.burn_proofs_dir);
+        .with_burn_proofs_dir(self.burn_proofs_dir)
+        .with_deadline(self.deadline);
 
         coordinator
             .run(
@@ -312,19 +356,19 @@ impl Scanner {
     /// Returns [`ScanError`] on fatal errors, timeout exhaustion, or
     /// intermittent errors after max retries.
     pub async fn run(self) -> Result<(Vec<WalletEvent>, bool), ScanError> {
-        self.run_internal(NoopEventSender).await
+        self.run_internal(EventChannel::None).await
     }
 
     /// Runs the scanner with real-time event streaming.
     ///
-    /// Returns an unbounded channel receiver for events and a future that
-    /// drives the scan. The caller should spawn a task to consume events
+    /// Returns a receiver for events (bounded if [`event_buffer`](Self::event_buffer)
+    /// is set) and a future that drives the scan. The caller should spawn a task to consume events
     /// from the receiver while awaiting the scan future.
     ///
     /// # Returns
     ///
     /// A tuple of:
-    /// - `UnboundedReceiver<ProcessingEvent>` - Channel for receiving scan events
+    /// - `EventReceiver` - Channel for receiving scan events
     /// - `Future` - The scan operation future
     ///
     /// # Example
@@ -350,13 +394,12 @@ impl Scanner {
     pub fn run_with_events(
         self,
     ) -> (
-        mpsc::UnboundedReceiver<ProcessingEvent>,
+        EventReceiver,
         impl std::future::Future<Output = Result<(Vec<WalletEvent>, bool), ScanError>>,
     ) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let event_sender = ChannelEventSender::new(tx);
-        let future = self.run_internal(event_sender);
-        (rx, future)
+        let (events, receiver) = self.event_channel();
+        let future = self.run_internal(events);
+        (receiver, future)
     }
 
     /// Runs the history backfill phase independently.
@@ -367,9 +410,10 @@ impl Scanner {
     ///
     /// Call this after a fast sync has completed and the wallet is already usable.
     /// The backfill fills in complete transaction history (spent outputs, inputs,
-    /// balance changes) for the period that was fast-synced.
+    /// balance changes) for the period that was fast-synced. A cancelled or
+    /// out-of-time backfill does not resume: the next one starts from the birthday.
     pub async fn run_backfill(self, backfill_to_height: u64) -> Result<(Vec<WalletEvent>, bool), ScanError> {
-        self.run_backfill_internal(backfill_to_height, NoopEventSender).await
+        self.run_backfill_internal(backfill_to_height, EventChannel::None).await
     }
 
     /// Runs the history backfill with real-time event streaming.
@@ -378,28 +422,45 @@ impl Scanner {
         self,
         backfill_to_height: u64,
     ) -> (
-        mpsc::UnboundedReceiver<ProcessingEvent>,
+        EventReceiver,
         impl std::future::Future<Output = Result<(Vec<WalletEvent>, bool), ScanError>>,
     ) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let event_sender = ChannelEventSender::new(tx);
-        let future = self.run_backfill_internal(backfill_to_height, event_sender);
-        (rx, future)
+        let (events, receiver) = self.event_channel();
+        let future = self.run_backfill_internal(backfill_to_height, events);
+        (receiver, future)
     }
 
-    async fn run_backfill_internal<E: EventSender + Clone + Send + 'static>(
+    fn event_channel(&self) -> (EventChannel, EventReceiver) {
+        match self.event_buffer {
+            Some(size) => {
+                // A tokio channel needs room for at least one event.
+                let (sender, receiver) = mpsc::channel(size.max(1));
+                let events = EventChannel::Bounded {
+                    sender,
+                    cancel: self.cancel_token.clone(),
+                };
+                (events, EventReceiver::Bounded(receiver))
+            },
+            None => {
+                let (sender, receiver) = mpsc::unbounded_channel();
+                (EventChannel::Unbounded(sender), EventReceiver::Unbounded(receiver))
+            },
+        }
+    }
+
+    async fn run_backfill_internal(
         self,
         backfill_to_height: u64,
-        event_sender: E,
+        events: EventChannel,
     ) -> Result<(Vec<WalletEvent>, bool), ScanError> {
         let pool = db::init_db(self.database_file.clone())?;
         let conn = pool.get().map_err(|e| ScanError::DbError(e.into()))?;
 
-        let accounts = db::get_accounts(&conn, self.account_name.as_deref())?;
+        let accounts = accounts_to_scan(&conn, self.account_name.as_deref())?;
         let coordinator = ScanCoordinator::new(
             pool,
             self.base_url,
-            event_sender,
+            events,
             self.retry_config,
             self.required_confirmations,
             self.webhook_config,
@@ -407,7 +468,8 @@ impl Scanner {
             self.reorg_check_interval,
             self.batch_size,
         )?
-        .with_burn_proofs_dir(self.burn_proofs_dir);
+        .with_burn_proofs_dir(self.burn_proofs_dir)
+        .with_deadline(self.deadline);
 
         coordinator
             .run_backfill(
@@ -418,5 +480,48 @@ impl Scanner {
                 self.cancel_token,
             )
             .await
+    }
+}
+
+/// The accounts a scan covers. A named account that does not exist is an
+/// error, so a scan never ends without a terminal event for the account asked for.
+fn accounts_to_scan(conn: &rusqlite::Connection, name: Option<&str>) -> Result<Vec<db::AccountRow>, ScanError> {
+    let accounts = db::get_accounts(conn, name)?;
+    if name.is_some() && accounts.is_empty() {
+        // The name stays out of the error: scan errors are logged.
+        return Err(ScanError::DbError(db::WalletDbError::InvalidInput(
+            "The account to scan was not found".to_string(),
+        )));
+    }
+    Ok(accounts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn scanning_an_unknown_account_is_an_error() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let database_file = dir.path().join("wallet.db");
+        db::init_db(database_file.clone()).expect("init db");
+
+        let scanner =
+            || Scanner::new("password", "http://127.0.0.1:1", database_file.clone(), 10, 3).account("missing");
+        let run = scanner().run().await;
+        assert!(matches!(
+            run,
+            Err(ScanError::DbError(db::WalletDbError::InvalidInput(_)))
+        ));
+        let (_, scan) = scanner().run_with_events();
+        assert!(matches!(
+            scan.await,
+            Err(ScanError::DbError(db::WalletDbError::InvalidInput(_)))
+        ));
+        let backfill = scanner().run_backfill(100).await;
+        assert!(matches!(
+            backfill,
+            Err(ScanError::DbError(db::WalletDbError::InvalidInput(_)))
+        ));
     }
 }

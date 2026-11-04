@@ -4,7 +4,7 @@ use axum::{
     Json,
     extract::{Path, Query, State},
 };
-use log::debug;
+use log::trace;
 
 use crate::{
     api::{AppState, error::ApiError, types::CompletedTransactionResponse},
@@ -103,7 +103,7 @@ pub async fn api_get_completed_transactions(
     let limit = pagination.limit.unwrap_or(DEFAULT_PAGE_LIMIT).min(MAX_PAGE_LIMIT);
     let offset = pagination.offset.unwrap_or(0).max(0);
 
-    debug!(
+    trace!(
         account = &*name,
         limit = limit,
         offset = offset;
@@ -201,7 +201,7 @@ pub async fn api_get_displayed_transactions(
     let limit = pagination.limit.unwrap_or(DEFAULT_PAGE_LIMIT).min(MAX_PAGE_LIMIT);
     let offset = pagination.offset.unwrap_or(0).max(0);
 
-    debug!(
+    trace!(
         account = &*name,
         limit = limit,
         offset = offset;
@@ -275,7 +275,7 @@ pub async fn api_get_completed_transaction_by_payref(
     State(app_state): State<AppState>,
     Path(PayrefParams { name, payref }): Path<PayrefParams>,
 ) -> Result<Json<CompletedTransactionResponse>, ApiError> {
-    debug!(
+    trace!(
         account = &*name,
         payref = &*payref;
         "API: Get completed transaction by payref request"
@@ -303,7 +303,7 @@ pub async fn api_get_completed_transaction_by_payref(
         // the api so that behaviour is explicit at the caller level (mirrors
         // the console wallet pattern at
         // applications/minotari_console_wallet/src/grpc/wallet_grpc_server.rs).
-        debug!(
+        trace!(
             account_id = account.id,
             payref = &*payref;
             "API: Primary completed payref lookup missed, checking history table"
@@ -372,7 +372,7 @@ pub async fn api_get_displayed_transactions_by_payref(
     State(app_state): State<AppState>,
     Path(PayrefParams { name, payref }): Path<PayrefParams>,
 ) -> Result<Json<Vec<DisplayedTransaction>>, ApiError> {
-    debug!(
+    trace!(
         account = &*name,
         payref = &*payref;
         "API: Get displayed transactions by payref request"
@@ -396,7 +396,7 @@ pub async fn api_get_displayed_transactions_by_payref(
         }
 
         // Fallback to payref history (same rationale as the completed path).
-        debug!(
+        trace!(
             account_id = account.id,
             payref = &*payref;
             "API: Primary displayed payref lookup missed, checking history table"
