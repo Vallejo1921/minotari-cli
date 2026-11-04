@@ -4,7 +4,7 @@ use axum::{
     Json,
     extract::{Path, State},
 };
-use log::debug;
+use log::trace;
 use serde::Deserialize;
 use tari_transaction_components::tari_amount::MicroMinotari;
 
@@ -107,7 +107,7 @@ pub async fn api_estimate_fees(
     Path(WalletParams { name }): Path<WalletParams>,
     Json(body): Json<EstimateFeeRequest>,
 ) -> Result<Json<Vec<FeeEstimateResponse>>, ApiError> {
-    debug!(
+    trace!(
         account = &*name,
         amount = &*mask_amount(body.amount.0.into());
         "API: Estimate fees request"

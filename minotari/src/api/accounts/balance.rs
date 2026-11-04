@@ -4,7 +4,7 @@ use axum::{
     Json,
     extract::{Path, State},
 };
-use log::{debug, info};
+use log::{debug, info, trace};
 use serde::Deserialize;
 
 use crate::{
@@ -119,7 +119,7 @@ pub async fn api_get_balance(
     State(app_state): State<AppState>,
     Path(WalletParams { name }): Path<WalletParams>,
 ) -> Result<Json<AccountBalance>, ApiError> {
-    debug!(
+    trace!(
         account = &*name;
         "API: Get balance request"
     );
@@ -186,7 +186,7 @@ pub async fn api_get_address(
     State(app_state): State<AppState>,
     Path(WalletParams { name }): Path<WalletParams>,
 ) -> Result<Json<AddressResponse>, ApiError> {
-    debug!(
+    trace!(
         account = &*name;
         "API: Get address request"
     );
@@ -286,7 +286,8 @@ pub async fn api_create_address_with_payment_id(
     let payment_id_bytes = hex::decode(&body.payment_id_hex)
         .map_err(|e| ApiError::BadRequest(format!("Invalid hex in payment_id_hex: {}", e)))?;
 
-    info!(
+    info!(target: "audit", "API: Create address with payment ID request");
+    trace!(
         target: "audit",
         account = &*name,
         payment_id_hex = &*body.payment_id_hex;
@@ -370,7 +371,7 @@ pub async fn api_get_scan_status(
     State(app_state): State<AppState>,
     Path(WalletParams { name }): Path<WalletParams>,
 ) -> Result<Json<ScanStatusResponse>, ApiError> {
-    debug!(
+    trace!(
         account = &*name;
         "API: Get scan status request"
     );

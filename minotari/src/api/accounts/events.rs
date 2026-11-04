@@ -4,7 +4,7 @@ use axum::{
     Json,
     extract::{Path, Query, State},
 };
-use log::debug;
+use log::trace;
 
 use crate::{
     api::{AppState, error::ApiError},
@@ -90,7 +90,7 @@ pub async fn api_get_events(
     let limit = pagination.limit.unwrap_or(DEFAULT_PAGE_LIMIT).min(MAX_PAGE_LIMIT);
     let offset = pagination.offset.unwrap_or(0).max(0);
 
-    debug!(
+    trace!(
         account = &*name,
         limit = limit,
         offset = offset;

@@ -304,9 +304,43 @@ pub enum IdempotencyConflict {
     },
 }
 
+impl IdempotencyConflict {
+    /// What went wrong, without the key, for logs above trace.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            IdempotencyConflict::OperationMismatch { .. } => "operation mismatch",
+            IdempotencyConflict::RequestMismatch { .. } => "request mismatch",
+            IdempotencyConflict::AlreadyCompleted { .. } => "already completed",
+            IdempotencyConflict::NoLongerActive { .. } => "no longer active",
+        }
+    }
+}
+
+/// An error's text for logs above trace: an idempotency conflict or a
+/// duplicate pending transaction names its key, so only the kind is shown.
+pub fn loggable_error(error: &anyhow::Error) -> String {
+    if let Some(conflict) = error.downcast_ref::<IdempotencyConflict>() {
+        return format!("idempotency conflict: {}", conflict.kind());
+    }
+    if let Some(crate::db::WalletDbError::DuplicateEntry(_)) = error.downcast_ref::<crate::db::WalletDbError>() {
+        return "duplicate pending transaction".to_string();
+    }
+    error.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_logged_conflict_does_not_name_its_key() {
+        let conflict = IdempotencyConflict::AlreadyCompleted {
+            key: "secret-key".to_string(),
+            operation: IdempotencyOperation::SendTransaction,
+        };
+        let logged = loggable_error(&anyhow::Error::from(conflict).context("sending"));
+        assert_eq!(logged, "idempotency conflict: already completed");
+    }
 
     fn fingerprint_of(operation: IdempotencyOperation, amount: u64, recipient: &str) -> String {
         RequestFingerprint::new(operation)

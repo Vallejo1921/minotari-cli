@@ -1,20 +1,21 @@
-use log::{debug, info, warn};
+use log::{info, trace, warn};
 use minotari_scanning::{HttpBlockchainScanner, scanning::BlockchainScanner};
-use std::{collections::VecDeque, path::PathBuf, sync::Arc};
+use std::{collections::VecDeque, path::PathBuf, sync::Arc, time::Instant};
 use tari_common_types::{seeds::cipher_seed::BIRTHDAY_GENESIS_FROM_UNIX_EPOCH, types::PrivateKey};
 use tari_transaction_components::key_manager::KeyManager;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    PauseReason, ScanStatusEvent,
-    db::{AccountRow, SqlitePool, WalletDbError},
+    ScanStatusEvent,
+    db::{self, AccountRow, SqlitePool, WalletDbError},
     http::WalletHttpClient,
     models::{OutputStatus, WalletEvent},
     scan::{
         DisplayedTransactionsEvent, ReorgDetectedEvent, ScanError, ScanMode, ScanRetryConfig, TransactionsUpdatedEvent,
         block_processor::BlockProcessor,
         config::OPTIMAL_SCANNING_THREADS,
-        events::{EventSender, FastSyncPhase, ProcessingEvent},
+        events::{ChannelEventSender, EventChannel, FastSyncPhase, ProcessingEvent},
         reorg,
         scan_db_handler::ScanDbHandler,
         scanner_state_manager::ScannerStateManager,
@@ -30,12 +31,18 @@ const MAX_CONTINUOUS_BUFFERED_EVENTS: usize = 10_000;
 const MAX_REWINDS_WITHOUT_PROGRESS: u32 = 3;
 
 /// Why a pass of the scan loop stopped.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScanStop {
-    /// The scan reached the chain tip.
+    /// The scan reached the chain tip (or its end height).
     CaughtUp,
-    /// The scan paused before reaching the chain tip.
-    Paused(PauseReason),
+    /// The cancel token fired.
+    Cancelled,
+    /// `ScanMode::Partial` scanned its `max_blocks`.
+    BlockLimit,
+    /// The deadline passed.
+    Deadline,
+    /// The deadline of a Continuous scan passed. Never reported as `Completed`.
+    ContinuousDeadline,
 }
 
 impl ScanStop {
@@ -43,13 +50,12 @@ impl ScanStop {
     ///
     /// Transactions can only change state when there is a new tip, so the
     /// monitor runs once per pass rather than per batch: when the scan is
-    /// caught up and when it stops at its block limit. A cancelled scan stops
-    /// without it.
-    fn runs_post_scan(&self) -> bool {
+    /// caught up and when it stops at its block limit. A cancelled scan, or
+    /// one out of time, stops without it.
+    fn runs_post_scan(self) -> bool {
         match self {
-            ScanStop::CaughtUp => true,
-            ScanStop::Paused(PauseReason::MaxBlocksReached { .. }) => true,
-            ScanStop::Paused(PauseReason::Cancelled) => false,
+            ScanStop::CaughtUp | ScanStop::BlockLimit => true,
+            ScanStop::Cancelled | ScanStop::Deadline | ScanStop::ContinuousDeadline => false,
         }
     }
 }
@@ -64,11 +70,11 @@ pub(crate) struct AccountSyncTarget {
     pub(crate) transaction_monitor: TransactionMonitor,
 }
 
-pub struct ScanCoordinator<E: EventSender> {
+pub struct ScanCoordinator {
     pool: SqlitePool,
     base_url: String,
     client: WalletHttpClient,
-    event_sender: E,
+    events: EventChannel,
     retry_config: ScanRetryConfig,
     required_confirmations: u64,
     webhook_config: Option<WebhookTriggerConfig>,
@@ -76,14 +82,15 @@ pub struct ScanCoordinator<E: EventSender> {
     reorg_check_interval: u64,
     batch_size: u64,
     burn_proofs_dir: Option<PathBuf>,
+    deadline: Option<Instant>,
 }
 
-impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
+impl ScanCoordinator {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         pool: SqlitePool,
         base_url: String,
-        event_sender: E,
+        events: EventChannel,
         retry_config: ScanRetryConfig,
         required_confirmations: u64,
         webhook_config: Option<WebhookTriggerConfig>,
@@ -101,7 +108,7 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
             pool,
             base_url,
             client,
-            event_sender,
+            events,
             retry_config,
             required_confirmations,
             webhook_config,
@@ -109,12 +116,29 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
             reorg_check_interval,
             batch_size,
             burn_proofs_dir: None,
+            deadline: None,
         })
     }
 
     pub fn with_burn_proofs_dir(mut self, dir: Option<PathBuf>) -> Self {
         self.burn_proofs_dir = dir;
         self
+    }
+
+    pub fn with_deadline(mut self, deadline: Option<Instant>) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
+    fn deadline_passed(&self) -> bool {
+        self.deadline.is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    /// Whether the deadline has passed with some account still below `end_height`.
+    /// A deadline that passes on the batch reaching the end does not stop the
+    /// scan, so it finishes the normal way.
+    fn deadline_short_of(&self, targets: &[AccountSyncTarget], end_height: u64) -> bool {
+        self.deadline_passed() && targets.iter().any(|target| target.next_block_to_scan <= end_height)
     }
 
     /// The main entry point for the multi-account scan.
@@ -131,6 +155,7 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
         }
 
         let mut conn = self.pool.get().map_err(|e| ScanError::DbError(e.into()))?;
+        let account_ids: Vec<i64> = accounts.iter().map(|account| account.id).collect();
 
         let first_km = accounts
             .first()
@@ -138,7 +163,7 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
             .get_key_manager(password)?;
         let Some(shared_reorg_scanner) = unless_cancelled(&cancel_token, self.create_reorg_scanner(first_km)).await
         else {
-            return self.handle_pause(&[], PauseReason::Cancelled, VecDeque::new());
+            return self.cancelled_at_startup(&account_ids).await;
         };
         let mut shared_reorg_scanner = shared_reorg_scanner?;
 
@@ -156,9 +181,8 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
                     &cancel_token,
                 )
                 .await?;
-            // Only the accounts prepared so far have a known height to report.
             let Some(target) = target else {
-                return self.handle_pause(&sync_targets, PauseReason::Cancelled, VecDeque::new());
+                return self.cancelled_at_startup(&account_ids).await;
             };
             sync_targets.push(target);
         }
@@ -276,9 +300,10 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
             .iter()
             .map(|target| (target.account.id, target.view_key.clone()))
             .collect();
+        let (block_events_tx, mut block_events) = mpsc::unbounded_channel();
         let block_processor = BlockProcessor::with_event_sender(
             all_accounts,
-            self.event_sender.clone(),
+            ChannelEventSender::new(block_events_tx),
             false,
             self.required_confirmations,
         );
@@ -293,11 +318,23 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
         // A node that reports a reorg at every check must not keep the scan rescanning.
         let mut rewind_high_water: u64 = 0;
         let mut rewinds_without_progress: u32 = 0;
+        let deadline_stop = match mode {
+            ScanMode::Continuous { .. } => ScanStop::ContinuousDeadline,
+            _ => ScanStop::Deadline,
+        };
         loop {
             if let Some(token) = &cancel_token
                 && token.is_cancelled()
             {
-                return self.handle_pause(&targets, PauseReason::Cancelled, all_events);
+                return self
+                    .stop_scan(
+                        &targets,
+                        ScanStop::Cancelled,
+                        tip_height,
+                        total_scanned_globally,
+                        all_events,
+                    )
+                    .await;
             }
 
             let global_next_block = targets.iter().map(|t| t.next_block_to_scan).min().unwrap_or(0);
@@ -345,12 +382,28 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
             )
             .await;
             let Some(scanner_and_config) = scanner_and_config else {
-                return self.handle_pause(&targets, PauseReason::Cancelled, all_events);
+                return self
+                    .stop_scan(
+                        &targets,
+                        ScanStop::Cancelled,
+                        tip_height,
+                        total_scanned_globally,
+                        all_events,
+                    )
+                    .await;
             };
             let (scanner, scanner_config) = scanner_and_config?;
             if refresh_tip {
                 let Some(tip) = unless_cancelled(&cancel_token, scanner.get_tip_info()).await else {
-                    return self.handle_pause(&targets, PauseReason::Cancelled, all_events);
+                    return self
+                        .stop_scan(
+                            &targets,
+                            ScanStop::Cancelled,
+                            tip_height,
+                            total_scanned_globally,
+                            all_events,
+                        )
+                        .await;
                 };
                 tip_height = tip
                     .map_err(|e| ScanError::Intermittent(e.to_string()))?
@@ -363,10 +416,19 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
                 .map_err(|e| ScanError::Intermittent(e.to_string()))?;
             let mut is_batch_empty = false;
             let mut max_new_height_in_batch = 0;
+            let mut scanned_in_pass = false;
             loop {
                 // Cancelling must not wait for a slow or retrying block download.
                 let Some(response) = unless_cancelled(&cancel_token, utxo_stream.recv()).await else {
-                    return self.handle_pause(&targets, PauseReason::Cancelled, all_events);
+                    return self
+                        .stop_scan(
+                            &targets,
+                            ScanStop::Cancelled,
+                            tip_height,
+                            total_scanned_globally,
+                            all_events,
+                        )
+                        .await;
                 };
                 let Some(response) = response else {
                     break;
@@ -380,14 +442,16 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
                 }
 
                 for account_id in &active_account_ids {
-                    self.event_sender
+                    self.events
                         .send(ProcessingEvent::ScanStatus(ScanStatusEvent::MoreBlocksAvailable {
                             account_id: *account_id,
                             last_scanned_height: global_next_block.saturating_sub(1),
-                        }));
+                        }))
+                        .await;
                 }
 
                 max_new_height_in_batch = global_next_block;
+                scanned_in_pass = true;
 
                 let shared_blocks = Arc::new(scanned_blocks);
 
@@ -412,6 +476,7 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
                             target.next_block_to_scan,
                         )
                         .await?;
+                    self.forward_block_events(&mut block_events).await;
                     Self::push_events_with_limit(&mut all_events, events, max_buffered_events);
                     if let Some(last) = shared_blocks.last() {
                         target.next_block_to_scan = next_block_height(last.height)?;
@@ -422,13 +487,14 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
 
                         db_handler.prune_tips(target.account.id, last.height).await?;
 
-                        self.event_sender
+                        self.events
                             .send(ProcessingEvent::ScanStatus(ScanStatusEvent::Progress {
                                 account_id: target.account.id,
                                 current_height: last.height,
                                 tip_height: tip_height.max(last.height),
                                 blocks_scanned: total_scanned_globally,
-                            }));
+                            }))
+                            .await;
                     }
                 }
 
@@ -461,49 +527,84 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
                 if let Some(token) = &cancel_token
                     && token.is_cancelled()
                 {
-                    return self.handle_pause(&targets, PauseReason::Cancelled, all_events);
+                    return self
+                        .stop_scan(
+                            &targets,
+                            ScanStop::Cancelled,
+                            tip_height,
+                            total_scanned_globally,
+                            all_events,
+                        )
+                        .await;
+                }
+                // A Partial scan that reached its block limit on this batch ends
+                // through the block limit path below, which runs the post-scan monitor.
+                let block_limit_reached =
+                    matches!(mode, ScanMode::Partial { max_blocks } if total_scanned_globally >= max_blocks);
+                if !block_limit_reached && self.deadline_short_of(&targets, tip_height) {
+                    info!(last_scanned_block = max_new_height_in_batch; "Scan deadline reached");
+                    return self
+                        .stop_scan(&targets, deadline_stop, tip_height, total_scanned_globally, all_events)
+                        .await;
                 }
             }
             if let ScanMode::Partial { max_blocks } = mode
                 && total_scanned_globally >= max_blocks
             {
                 info!(last_scanned_block = max_new_height_in_batch; "Scan completed successfully up to stop height");
-                let stop = ScanStop::Paused(PauseReason::MaxBlocksReached { limit: max_blocks });
-                self.finish_pass(&targets, &stop, &mut all_events, max_buffered_events)
+                self.finish_pass(&targets, ScanStop::BlockLimit, &mut all_events, max_buffered_events)
                     .await?;
-                return self.handle_pause(
-                    &targets,
-                    PauseReason::MaxBlocksReached { limit: max_blocks },
-                    all_events,
-                );
+                return self
+                    .stop_scan(
+                        &targets,
+                        ScanStop::BlockLimit,
+                        tip_height,
+                        total_scanned_globally,
+                        all_events,
+                    )
+                    .await;
             }
             if is_batch_empty {
                 if let Some(token) = &cancel_token
                     && token.is_cancelled()
                 {
-                    return self.handle_pause(&targets, PauseReason::Cancelled, all_events);
+                    return self
+                        .stop_scan(
+                            &targets,
+                            ScanStop::Cancelled,
+                            tip_height,
+                            total_scanned_globally,
+                            all_events,
+                        )
+                        .await;
+                }
+                // The pass stopped below an account further ahead: scan on from
+                // there. Blocks were scanned, so the lagging cursors moved up.
+                if next_horizon_height.is_some() && scanned_in_pass {
+                    continue;
                 }
                 // Settle pending transactions before reporting completion, and
                 // before `wait_for_next_poll_cycle` moves the cursor back a block.
-                self.finish_pass(&targets, &ScanStop::CaughtUp, &mut all_events, max_buffered_events)
+                self.finish_pass(&targets, ScanStop::CaughtUp, &mut all_events, max_buffered_events)
                     .await?;
 
-                for account_id in &active_account_ids {
-                    let Some(target) = targets.iter().find(|target| target.account.id == *account_id) else {
-                        return Err(ScanError::Fatal(anyhow::anyhow!(
-                            "Unknown active account id: {}",
-                            account_id
-                        )));
-                    };
-                    self.event_sender
-                        .send(ProcessingEvent::ScanStatus(ScanStatusEvent::Completed {
-                            account_id: target.account.id,
-                            final_height: target.next_block_to_scan.saturating_sub(1),
-                            total_blocks_scanned: total_scanned_globally,
-                        }));
-                }
-
                 if let ScanMode::Continuous { poll_interval } = mode {
+                    if self.deadline_passed() {
+                        return self
+                            .stop_scan(
+                                &targets,
+                                ScanStop::ContinuousDeadline,
+                                tip_height,
+                                total_scanned_globally,
+                                all_events,
+                            )
+                            .await;
+                    }
+                    // Wake up at the deadline rather than sleep past it.
+                    let poll_interval = match self.deadline {
+                        Some(deadline) => poll_interval.min(deadline.saturating_duration_since(Instant::now())),
+                        None => poll_interval,
+                    };
                     self.wait_for_next_poll_cycle(
                         &mut targets,
                         &db_handler,
@@ -517,8 +618,23 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
                     continue;
                 }
 
-                return Ok((all_events.into_iter().collect(), false));
+                return self
+                    .stop_scan(
+                        &targets,
+                        ScanStop::CaughtUp,
+                        tip_height,
+                        total_scanned_globally,
+                        all_events,
+                    )
+                    .await;
             }
+        }
+    }
+
+    /// Sends on the events the block processor emitted for the last batch.
+    async fn forward_block_events(&self, block_events: &mut mpsc::UnboundedReceiver<ProcessingEvent>) {
+        while let Ok(event) = block_events.try_recv() {
+            self.events.send(event).await;
         }
     }
 
@@ -541,7 +657,7 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
     async fn check_global_reorgs(
         &self,
         targets: &mut [AccountSyncTarget],
-        db_handler: &ScanDbHandler<E>,
+        db_handler: &ScanDbHandler<ChannelEventSender>,
         scanner: &mut HttpBlockchainScanner<KeyManager>,
         scanning_offset: u64,
         cancel: &Option<CancellationToken>,
@@ -551,13 +667,16 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
             return Ok(rewound);
         }
 
-        let mut conn = db_handler.get_connection().await?;
         for target in targets {
+            // The connection is released before the reorg is reported, which can
+            // wait on a slow consumer.
+            let mut conn = db_handler.get_connection().await?;
             let res = unless_cancelled(
                 cancel,
                 reorg::handle_reorgs(scanner, &mut conn, target.account.id, self.webhook_config.clone()),
             )
             .await;
+            drop(conn);
             let Some(res) = res else {
                 return Ok(rewound);
             };
@@ -588,46 +707,126 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
     async fn wait_for_next_poll_cycle(
         &self,
         targets: &mut [AccountSyncTarget],
-        db_handler: &ScanDbHandler<E>,
+        db_handler: &ScanDbHandler<ChannelEventSender>,
         interval: std::time::Duration,
         cancel: &Option<CancellationToken>,
         scanner: &mut HttpBlockchainScanner<KeyManager>,
         scanning_offset: u64,
     ) -> Result<(), ScanError> {
-        for target in targets.iter_mut() {
-            target.next_block_to_scan = target.next_block_to_scan.saturating_sub(1);
-
-            self.event_sender
+        for target in targets.iter() {
+            self.events
                 .send(ProcessingEvent::ScanStatus(ScanStatusEvent::Waiting {
                     account_id: target.account.id,
                     resume_in: interval,
-                }));
+                }))
+                .await;
         }
 
-        // A cancel here is picked up at the top of the scan loop.
+        // A cancel here is picked up at the top of the scan loop, with every
+        // cursor still just past the last scanned block.
         if unless_cancelled(cancel, tokio::time::sleep(interval)).await.is_none() {
             return Ok(());
         }
+        let before: Vec<u64> = targets.iter().map(|target| target.next_block_to_scan).collect();
         self.check_global_reorgs(targets, db_handler, scanner, scanning_offset, cancel)
             .await?;
+        if cancel.as_ref().is_some_and(|token| token.is_cancelled()) {
+            return Ok(());
+        }
+        // Rescan the last block of every account the reorg check did not move.
+        for (target, height) in targets.iter_mut().zip(before) {
+            if target.next_block_to_scan == height {
+                target.next_block_to_scan = height.saturating_sub(1);
+            }
+        }
         Ok(())
     }
 
-    fn handle_pause(
+    /// Sends each account's terminal event and returns the scan result.
+    async fn stop_scan(
         &self,
         targets: &[AccountSyncTarget],
-        reason: PauseReason,
+        stop: ScanStop,
+        tip_height: u64,
+        total_blocks_scanned: u64,
         events: VecDeque<WalletEvent>,
     ) -> Result<(Vec<WalletEvent>, bool), ScanError> {
-        for t in targets {
-            self.event_sender
-                .send(ProcessingEvent::ScanStatus(ScanStatusEvent::Paused {
-                    account_id: t.account.id,
-                    last_scanned_height: t.next_block_to_scan.saturating_sub(1),
-                    reason: reason.clone(),
-                }));
+        let more_blocks = self
+            .send_terminal_events(targets, stop, tip_height, total_blocks_scanned)
+            .await;
+        Ok((events.into_iter().collect(), more_blocks))
+    }
+
+    /// Sends one terminal event per account and returns whether blocks remain.
+    ///
+    /// A Full or Partial budget stop at or past `tip_height` is reported as `Completed`.
+    async fn send_terminal_events(
+        &self,
+        targets: &[AccountSyncTarget],
+        stop: ScanStop,
+        tip_height: u64,
+        total_blocks_scanned: u64,
+    ) -> bool {
+        let mut more_blocks = false;
+        for target in targets {
+            let account_id = target.account.id;
+            let last_scanned_height = target.next_block_to_scan.saturating_sub(1);
+            let event = match stop {
+                ScanStop::Cancelled => {
+                    more_blocks = true;
+                    ScanStatusEvent::Cancelled {
+                        account_id,
+                        last_scanned_height,
+                    }
+                },
+                ScanStop::ContinuousDeadline => {
+                    more_blocks = true;
+                    ScanStatusEvent::BudgetExhausted {
+                        account_id,
+                        last_scanned_height,
+                        tip_height,
+                    }
+                },
+                ScanStop::BlockLimit | ScanStop::Deadline if last_scanned_height < tip_height => {
+                    more_blocks = true;
+                    ScanStatusEvent::BudgetExhausted {
+                        account_id,
+                        last_scanned_height,
+                        tip_height,
+                    }
+                },
+                _ => ScanStatusEvent::Completed {
+                    account_id,
+                    final_height: last_scanned_height,
+                    total_blocks_scanned,
+                },
+            };
+            self.events.send_always(ProcessingEvent::ScanStatus(event)).await;
         }
-        Ok((events.into_iter().collect(), true))
+        more_blocks
+    }
+
+    /// Reports a scan cancelled before every account was prepared, each at the
+    /// last block stored for it.
+    async fn cancelled_at_startup(&self, account_ids: &[i64]) -> Result<(Vec<WalletEvent>, bool), ScanError> {
+        let mut heights = Vec::with_capacity(account_ids.len());
+        {
+            let conn = self.pool.get().map_err(|e| ScanError::DbError(e.into()))?;
+            for account_id in account_ids {
+                let last_scanned_height =
+                    db::get_latest_scanned_tip_block_by_account(&conn, *account_id)?.map_or(0, |block| block.height);
+                heights.push((*account_id, last_scanned_height));
+            }
+        }
+        for (account_id, last_scanned_height) in heights {
+            self.events
+                .send_always(ProcessingEvent::ScanStatus(ScanStatusEvent::Cancelled {
+                    account_id,
+                    last_scanned_height,
+                }))
+                .await;
+        }
+        Ok((Vec::new(), true))
     }
 
     /// Runs the post-scan monitor if the scan pass stopped in a way that calls
@@ -635,7 +834,7 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
     async fn finish_pass(
         &self,
         targets: &[AccountSyncTarget],
-        stop: &ScanStop,
+        stop: ScanStop,
         all_events: &mut VecDeque<WalletEvent>,
         max_buffered_events: Option<usize>,
     ) -> Result<(), ScanError> {
@@ -684,7 +883,8 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
             };
 
             wallet_events.extend(monitor_res.wallet_events.clone());
-            self.emit_monitor_events(target.account.id, scanned_height, monitor_res);
+            self.emit_monitor_events(target.account.id, scanned_height, monitor_res)
+                .await;
         }
         Ok(wallet_events)
     }
@@ -697,20 +897,22 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
     /// every monitor update (a confirmation count, a status change) as a new
     /// transaction and must de-duplicate. This is the library's public event
     /// contract and is kept as is.
-    fn emit_monitor_events(&self, account_id: i64, height: u64, res: MonitoringResult) {
+    async fn emit_monitor_events(&self, account_id: i64, height: u64, res: MonitoringResult) {
         if !res.updated_displayed_transactions.is_empty() {
-            self.event_sender
+            self.events
                 .send(ProcessingEvent::TransactionsUpdated(TransactionsUpdatedEvent {
                     account_id,
                     updated_transactions: res.updated_displayed_transactions.clone(),
-                }));
-            self.event_sender
+                }))
+                .await;
+            self.events
                 .send(ProcessingEvent::TransactionsReady(DisplayedTransactionsEvent {
                     account_id,
                     transactions: res.updated_displayed_transactions,
                     block_height: Some(height),
                     is_initial_sync: false,
-                }));
+                }))
+                .await;
         }
     }
 
@@ -742,7 +944,7 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
             }
         }
         if resume_height != 0 {
-            self.emit_reorg_event(account.id, info, resume_height);
+            self.emit_reorg_event(account.id, info, resume_height).await;
             return Ok(Some(resume_height));
         }
         let lookup = async {
@@ -761,23 +963,23 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
         };
         match unless_cancelled(cancel, lookup).await {
             Some(Ok(birthday)) => {
-                self.emit_reorg_event(account.id, info, birthday);
+                self.emit_reorg_event(account.id, info, birthday).await;
                 Ok(Some(birthday))
             },
             Some(Err(e)) => {
-                self.emit_reorg_event(account.id, info, 0);
+                self.emit_reorg_event(account.id, info, 0).await;
                 Err(e)
             },
             None => {
-                self.emit_reorg_event(account.id, info, 0);
+                self.emit_reorg_event(account.id, info, 0).await;
                 Ok(None)
             },
         }
     }
 
-    fn emit_reorg_event(&self, account_id: i64, reorg_info: reorg::ReorgInformation, resume_height: u64) {
-        self.event_sender
-            .send(ProcessingEvent::ReorgDetected(ReorgDetectedEvent {
+    async fn emit_reorg_event(&self, account_id: i64, reorg_info: reorg::ReorgInformation, resume_height: u64) {
+        self.events
+            .send_always(ProcessingEvent::ReorgDetected(ReorgDetectedEvent {
                 account_id,
                 reorg_from_height: reorg_info.rolled_back_from_height,
                 new_height: resume_height,
@@ -785,7 +987,8 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
                 invalidated_output_hashes: reorg_info.invalidated_output_hashes,
                 cancelled_transaction_ids: reorg_info.cancelled_transaction_ids,
                 reorganized_displayed_transactions: reorg_info.reorganized_displayed_transactions,
-            }));
+            }))
+            .await;
     }
 
     /// Runs the three-phase fast sync strategy.
@@ -816,65 +1019,87 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
 
         // --- Phase 1: Fast UTXO scan (birthday -> fast_sync_target, exclude_spent=true) ---
         for target in &targets {
-            self.event_sender
+            self.events
                 .send(ProcessingEvent::ScanStatus(ScanStatusEvent::FastSyncPhaseStarted {
                     account_id: target.account.id,
                     phase: FastSyncPhase::FastUtxoScan,
                     from_height: target.next_block_to_scan,
                     to_height: Some(fast_sync_target),
-                }));
+                }))
+                .await;
         }
 
-        let (events, _) = self
+        let (events, stop, fast_scanned) = self
             .fast_sync_loop(&mut targets, fast_sync_target, tip_height, &cancel_token)
             .await?;
         all_events.extend(events);
+        if stop != ScanStop::CaughtUp {
+            let more_blocks = self
+                .send_terminal_events(&targets, stop, tip_height, fast_scanned)
+                .await;
+            return Ok((all_events, more_blocks));
+        }
 
         for target in &targets {
-            self.event_sender
+            self.events
                 .send(ProcessingEvent::ScanStatus(ScanStatusEvent::FastSyncPhaseCompleted {
                     account_id: target.account.id,
                     phase: FastSyncPhase::FastUtxoScan,
-                }));
+                }))
+                .await;
         }
 
-        // Check cancellation between phases
-        if let Some(token) = &cancel_token
-            && token.is_cancelled()
-        {
-            return Ok((all_events, true));
+        // Phase 1 ended on its last batch after the deadline: do not start phase 2.
+        // A phase 1 with nothing to scan does not count, or the scan could never progress.
+        if fast_scanned > 0 && self.deadline_short_of(&targets, tip_height) {
+            let more_blocks = self
+                .send_terminal_events(&targets, ScanStop::Deadline, tip_height, fast_scanned)
+                .await;
+            return Ok((all_events, more_blocks));
         }
 
         // --- Phase 2: Recent full scan (fast_sync_target -> tip) ---
         // Targets already have next_block_to_scan set to fast_sync_target + 1
         // from Phase 1, so no reset needed.
         for target in &targets {
-            self.event_sender
+            self.events
                 .send(ProcessingEvent::ScanStatus(ScanStatusEvent::FastSyncPhaseStarted {
                     account_id: target.account.id,
                     phase: FastSyncPhase::RecentFullScan,
                     from_height: fast_sync_target,
                     to_height: None,
-                }));
+                }))
+                .await;
         }
 
         // Phase 2 uses the same simple loop pattern as fast_sync_loop but without
         // exclude_spent, effectively doing a full scan of recent blocks.
-        let (events, _) = self
+        let (events, stop, recent_scanned) = self
             .recent_full_scan_loop(&mut targets, tip_height, &cancel_token)
             .await?;
         all_events.extend(events);
+        let total_scanned = fast_scanned.saturating_add(recent_scanned);
+        if stop != ScanStop::CaughtUp {
+            let more_blocks = self
+                .send_terminal_events(&targets, stop, tip_height, total_scanned)
+                .await;
+            return Ok((all_events, more_blocks));
+        }
 
         for target in &targets {
-            self.event_sender
+            self.events
                 .send(ProcessingEvent::ScanStatus(ScanStatusEvent::FastSyncPhaseCompleted {
                     account_id: target.account.id,
                     phase: FastSyncPhase::RecentFullScan,
-                }));
+                }))
+                .await;
         }
 
         info!("Fast sync completed (wallet is now usable; run backfill separately for full history)");
-        Ok((all_events, false))
+        let more_blocks = self
+            .send_terminal_events(&targets, ScanStop::CaughtUp, tip_height, total_scanned)
+            .await;
+        Ok((all_events, more_blocks))
     }
 
     /// Runs the history backfill phase separately.
@@ -896,6 +1121,7 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
         }
 
         let mut conn = self.pool.get().map_err(|e| ScanError::DbError(e.into()))?;
+        let account_ids: Vec<i64> = accounts.iter().map(|account| account.id).collect();
 
         let first_km = accounts
             .first()
@@ -917,7 +1143,7 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
                 )
                 .await?;
             let Some(mut target) = target else {
-                return Ok((Vec::new(), true));
+                return self.cancelled_at_startup(&account_ids).await;
             };
 
             // Backfill always rescans from the account birthday. prepare_target
@@ -935,19 +1161,26 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
         let mut all_events = Vec::new();
 
         for target in &targets {
-            self.event_sender
+            self.events
                 .send(ProcessingEvent::ScanStatus(ScanStatusEvent::FastSyncPhaseStarted {
                     account_id: target.account.id,
                     phase: FastSyncPhase::HistoryBackfill,
                     from_height: target.next_block_to_scan,
                     to_height: Some(backfill_to_height),
-                }));
+                }))
+                .await;
         }
 
-        let (events, _) = self
+        let (events, stop, total_scanned) = self
             .backfill_loop(&mut targets, backfill_to_height, &cancel_token)
             .await?;
         all_events.extend(events);
+        if stop != ScanStop::CaughtUp {
+            let more_blocks = self
+                .send_terminal_events(&targets, stop, backfill_to_height, total_scanned)
+                .await;
+            return Ok((all_events, more_blocks));
+        }
 
         // Resolve SpentUnconfirmed outputs:
         // 1. Mark outputs with matching inputs as Spent
@@ -975,15 +1208,19 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
                 self.verify_spent_unconfirmed_outputs(target, &unresolved).await?;
             }
 
-            self.event_sender
+            self.events
                 .send(ProcessingEvent::ScanStatus(ScanStatusEvent::FastSyncPhaseCompleted {
                     account_id: target.account.id,
                     phase: FastSyncPhase::HistoryBackfill,
-                }));
+                }))
+                .await;
         }
 
         info!("History backfill completed");
-        Ok((all_events, false))
+        let more_blocks = self
+            .send_terminal_events(&targets, ScanStop::CaughtUp, backfill_to_height, total_scanned)
+            .await;
+        Ok((all_events, more_blocks))
     }
 
     /// Phase 1: Fast sync loop scanning only unspent outputs.
@@ -993,7 +1230,7 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
         end_height: u64,
         tip_height: u64,
         cancel_token: &Option<CancellationToken>,
-    ) -> Result<(Vec<WalletEvent>, bool), ScanError> {
+    ) -> Result<(Vec<WalletEvent>, ScanStop, u64), ScanError> {
         let mut all_events = Vec::new();
         let mut state_manager = ScannerStateManager::new();
         let mut total_scanned = 0u64;
@@ -1002,9 +1239,10 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
             .iter()
             .map(|target| (target.account.id, target.view_key.clone()))
             .collect();
+        let (block_events_tx, mut block_events) = mpsc::unbounded_channel();
         let mut block_processor = BlockProcessor::with_event_sender(
             all_accounts,
-            self.event_sender.clone(),
+            ChannelEventSender::new(block_events_tx),
             false,
             self.required_confirmations,
         );
@@ -1020,7 +1258,7 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
             .collect();
 
         if active_account_ids.is_empty() || global_next_block > end_height {
-            return Ok((all_events, false));
+            return Ok((all_events, ScanStop::CaughtUp, 0));
         }
 
         let (scanner, mut scanner_config) = state_manager
@@ -1045,10 +1283,12 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
             .await
             .map_err(|e| ScanError::Intermittent(e.to_string()))?;
 
+        let mut stop = ScanStop::CaughtUp;
         while let Some(response) = utxo_stream.recv().await {
             if let Some(token) = cancel_token
                 && token.is_cancelled()
             {
+                stop = ScanStop::Cancelled;
                 break;
             }
 
@@ -1074,23 +1314,34 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
                         target.next_block_to_scan,
                     )
                     .await?;
+                self.forward_block_events(&mut block_events).await;
                 all_events.extend(events);
 
                 if let Some(last) = shared_blocks.last() {
                     target.next_block_to_scan = next_block_height(last.height)?;
 
-                    self.event_sender
+                    self.events
                         .send(ProcessingEvent::ScanStatus(ScanStatusEvent::Progress {
                             account_id: target.account.id,
                             current_height: last.height,
                             tip_height: tip_height.max(last.height),
                             blocks_scanned: total_scanned,
-                        }));
+                        }))
+                        .await;
                 }
+            }
+
+            // Past the deadline, stop at this batch: out of budget if an account is
+            // still below the end, otherwise done (the rest of the stream is past it).
+            if self.deadline_passed() {
+                if self.deadline_short_of(targets, end_height) {
+                    stop = ScanStop::Deadline;
+                }
+                break;
             }
         }
 
-        Ok((all_events, false))
+        Ok((all_events, stop, total_scanned))
     }
 
     /// Phase 2: Full scan of recent blocks from fast_sync_target to tip.
@@ -1099,7 +1350,7 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
         targets: &mut [AccountSyncTarget],
         tip_height: u64,
         cancel_token: &Option<CancellationToken>,
-    ) -> Result<(Vec<WalletEvent>, bool), ScanError> {
+    ) -> Result<(Vec<WalletEvent>, ScanStop, u64), ScanError> {
         let mut all_events = Vec::new();
         let mut state_manager = ScannerStateManager::new();
         let mut total_scanned = 0u64;
@@ -1108,9 +1359,10 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
             .iter()
             .map(|target| (target.account.id, target.view_key.clone()))
             .collect();
+        let (block_events_tx, mut block_events) = mpsc::unbounded_channel();
         let block_processor = BlockProcessor::with_event_sender(
             all_accounts,
-            self.event_sender.clone(),
+            ChannelEventSender::new(block_events_tx),
             false,
             self.required_confirmations,
         );
@@ -1137,12 +1389,12 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
             .await
             .map_err(|e| ScanError::Intermittent(e.to_string()))?;
 
-        let mut cancelled = false;
+        let mut stop = ScanStop::CaughtUp;
         while let Some(response) = utxo_stream.recv().await {
             if let Some(token) = cancel_token
                 && token.is_cancelled()
             {
-                cancelled = true;
+                stop = ScanStop::Cancelled;
                 break;
             }
 
@@ -1172,34 +1424,40 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
                         target.next_block_to_scan,
                     )
                     .await?;
+                self.forward_block_events(&mut block_events).await;
                 all_events.extend(events);
 
                 if let Some(last) = shared_blocks.last() {
                     target.next_block_to_scan = next_block_height(last.height)?;
 
-                    self.event_sender
+                    self.events
                         .send(ProcessingEvent::ScanStatus(ScanStatusEvent::Progress {
                             account_id: target.account.id,
                             current_height: last.height,
                             tip_height: tip_height.max(last.height),
                             blocks_scanned: total_scanned,
-                        }));
+                        }))
+                        .await;
                 }
+            }
+
+            // Past the deadline, stop at this batch: out of budget if an account is
+            // still below the end, otherwise done (the rest of the stream is past it).
+            if self.deadline_passed() {
+                if self.deadline_short_of(targets, tip_height) {
+                    stop = ScanStop::Deadline;
+                }
+                break;
             }
         }
 
         // The end of the fast sync: settle pending transactions once, at the
-        // height each account reached. Not when cancelled.
-        let stop = if cancelled {
-            ScanStop::Paused(PauseReason::Cancelled)
-        } else {
-            ScanStop::CaughtUp
-        };
+        // height each account reached. Not when cancelled or out of time.
         if stop.runs_post_scan() {
             all_events.extend(self.run_post_scan(targets).await?);
         }
 
-        Ok((all_events, false))
+        Ok((all_events, stop, total_scanned))
     }
 
     /// Phase 3: Backfill loop scanning full blocks with OR IGNORE for existing data.
@@ -1208,7 +1466,7 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
         targets: &mut [AccountSyncTarget],
         end_height: u64,
         cancel_token: &Option<CancellationToken>,
-    ) -> Result<(Vec<WalletEvent>, bool), ScanError> {
+    ) -> Result<(Vec<WalletEvent>, ScanStop, u64), ScanError> {
         let mut all_events = Vec::new();
         let mut state_manager = ScannerStateManager::new();
         let mut total_scanned = 0u64;
@@ -1217,9 +1475,10 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
             .iter()
             .map(|target| (target.account.id, target.view_key.clone()))
             .collect();
+        let (block_events_tx, mut block_events) = mpsc::unbounded_channel();
         let mut block_processor = BlockProcessor::with_event_sender(
             all_accounts,
-            self.event_sender.clone(),
+            ChannelEventSender::new(block_events_tx),
             false,
             self.required_confirmations,
         );
@@ -1234,7 +1493,7 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
             .collect();
 
         if active_account_ids.is_empty() || global_next_block > end_height {
-            return Ok((all_events, false));
+            return Ok((all_events, ScanStop::CaughtUp, 0));
         }
 
         let (scanner, scanner_config) = state_manager
@@ -1255,10 +1514,12 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
             .await
             .map_err(|e| ScanError::Intermittent(e.to_string()))?;
 
+        let mut stop = ScanStop::CaughtUp;
         while let Some(response) = utxo_stream.recv().await {
             if let Some(token) = cancel_token
                 && token.is_cancelled()
             {
+                stop = ScanStop::Cancelled;
                 break;
             }
 
@@ -1284,23 +1545,34 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
                         target.next_block_to_scan,
                     )
                     .await?;
+                self.forward_block_events(&mut block_events).await;
                 all_events.extend(events);
 
                 if let Some(last) = shared_blocks.last() {
                     target.next_block_to_scan = next_block_height(last.height)?;
 
-                    self.event_sender
+                    self.events
                         .send(ProcessingEvent::ScanStatus(ScanStatusEvent::Progress {
                             account_id: target.account.id,
                             current_height: last.height,
                             tip_height: end_height.max(last.height),
                             blocks_scanned: total_scanned,
-                        }));
+                        }))
+                        .await;
                 }
+            }
+
+            // Past the deadline, stop at this batch: out of budget if an account is
+            // still below the end, otherwise done (the rest of the stream is past it).
+            if self.deadline_passed() {
+                if self.deadline_short_of(targets, end_height) {
+                    stop = ScanStop::Deadline;
+                }
+                break;
             }
         }
 
-        Ok((all_events, false))
+        Ok((all_events, stop, total_scanned))
     }
 
     /// Verifies remaining SpentUnconfirmed outputs against the base node using
@@ -1358,7 +1630,7 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
                         output_id: output.output_id,
                     });
                 } else {
-                    debug!(
+                    trace!(
                         account = &*target.account.friendly_name,
                         output_hash = &*utxo_info.utxo_hash.to_hex();
                         "Output unknown by base node, status kept as SpentUnconfirmed"
@@ -1497,7 +1769,6 @@ mod tests {
         create_account, get_account_by_name, get_displayed_transaction_by_id, get_scanned_tip_blocks_by_account,
         init_db, insert_displayed_transaction, insert_scanned_tip_block,
     };
-    use crate::scan::events::ChannelEventSender;
     use crate::transactions::idempotency::{IdempotencyBinding, IdempotencyOperation, RequestFingerprint};
     use crate::transactions::{
         BlockchainInfo, DisplayedTransaction, TransactionDetails, TransactionDirection, TransactionDisplayStatus,
@@ -1550,8 +1821,9 @@ mod tests {
     #[test]
     fn the_post_scan_monitor_runs_when_caught_up_or_at_the_block_limit_but_not_when_cancelled() {
         assert!(ScanStop::CaughtUp.runs_post_scan());
-        assert!(ScanStop::Paused(PauseReason::MaxBlocksReached { limit: 10 }).runs_post_scan());
-        assert!(!ScanStop::Paused(PauseReason::Cancelled).runs_post_scan());
+        assert!(ScanStop::BlockLimit.runs_post_scan());
+        assert!(!ScanStop::Cancelled.runs_post_scan());
+        assert!(!ScanStop::Deadline.runs_post_scan());
     }
 
     /// The hash the mock chain gives the block at `height`.
@@ -1659,10 +1931,12 @@ mod tests {
                             "metadata": {
                                 "best_block_height": self.tip,
                                 "best_block_hash": self.hash(self.tip),
-                                "accumulated_difficulty": "0",
+                                "accumulated_difficulty": "0x0",
+                                "pruning_horizon": 0,
                                 "pruned_height": 0,
                                 "timestamp": 0,
-                            }
+                            },
+                            "is_synced": true,
                         }))
                         .set_delay(delay)
                 },
@@ -1724,7 +1998,7 @@ mod tests {
     }
 
     struct Setup {
-        coordinator: ScanCoordinator<ChannelEventSender>,
+        coordinator: ScanCoordinator,
         events: UnboundedReceiver<ProcessingEvent>,
         pool: SqlitePool,
         account_id: i64,
@@ -1760,10 +2034,29 @@ mod tests {
         drop(conn);
 
         let (sender, events) = tokio::sync::mpsc::unbounded_channel();
-        let coordinator = ScanCoordinator::new(
+        let coordinator = new_coordinator(&pool, &server, EventChannel::Unbounded(sender), reorg_check_interval);
+
+        Setup {
+            coordinator,
+            events,
+            pool,
+            account_id: account.id,
+            server,
+            _dir: dir,
+        }
+    }
+
+    /// A coordinator scanning 10 blocks per batch with one processing thread.
+    fn new_coordinator(
+        pool: &SqlitePool,
+        server: &MockServer,
+        events: EventChannel,
+        reorg_check_interval: u64,
+    ) -> ScanCoordinator {
+        ScanCoordinator::new(
             pool.clone(),
             server.uri(),
-            ChannelEventSender::new(sender),
+            events,
             ScanRetryConfig {
                 timeout: std::time::Duration::from_secs(5),
                 max_timeout_retries: 1,
@@ -1776,16 +2069,7 @@ mod tests {
             reorg_check_interval,
             10,
         )
-        .expect("coordinator");
-
-        Setup {
-            coordinator,
-            events,
-            pool,
-            account_id: account.id,
-            server,
-            _dir: dir,
-        }
+        .expect("coordinator")
     }
 
     fn mined_pending_send(account_id: i64, block_height: u64) -> DisplayedTransaction {
@@ -1882,6 +2166,530 @@ mod tests {
         })
         .expect("completed");
         assert!(updated < completed, "monitor events come before Completed");
+        assert_eq!(terminal_count(&events), 1);
+    }
+
+    fn max_tip_height(pool: &SqlitePool, account_id: i64) -> u64 {
+        let conn = pool.get().expect("conn");
+        let tips = get_scanned_tip_blocks_by_account(&conn, account_id).expect("tips");
+        tips.iter().map(|t| t.height).max().expect("a tip")
+    }
+
+    #[tokio::test]
+    async fn a_scan_past_its_deadline_stops_after_one_batch_and_the_next_run_resumes_there() {
+        let mut setup = setup(1500, 1600).await;
+        setup.coordinator.deadline = Some(Instant::now());
+
+        let (_, more_blocks) = setup
+            .coordinator
+            .run(vec![account(&setup.pool)], "password", ScanMode::Full, 0, None)
+            .await
+            .expect("scan");
+        assert!(more_blocks);
+        let events = drain(&mut setup.events);
+        assert_eq!(terminal_count(&events), 1);
+        let stopped_at = events
+            .iter()
+            .find_map(|e| match e {
+                ProcessingEvent::ScanStatus(ScanStatusEvent::BudgetExhausted {
+                    last_scanned_height,
+                    tip_height,
+                    ..
+                }) => Some((*last_scanned_height, *tip_height)),
+                _ => None,
+            })
+            .expect("budget exhausted");
+        assert_eq!(stopped_at, (1510, 1600), "one batch of 10 blocks is scanned");
+        assert_eq!(max_tip_height(&setup.pool, setup.account_id), 1510);
+
+        setup.coordinator.deadline = None;
+        setup
+            .coordinator
+            .run(vec![account(&setup.pool)], "password", ScanMode::Full, 0, None)
+            .await
+            .expect("scan");
+        let events = drain(&mut setup.events);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ProcessingEvent::ScanStatus(ScanStatusEvent::MoreBlocksAvailable {
+                last_scanned_height: 1510,
+                ..
+            })
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ProcessingEvent::ScanStatus(ScanStatusEvent::Completed { final_height: 1600, .. })
+        )));
+        assert_eq!(terminal_count(&events), 1);
+    }
+
+    fn is_phase_completed(event: &ProcessingEvent) -> bool {
+        matches!(
+            event,
+            ProcessingEvent::ScanStatus(ScanStatusEvent::FastSyncPhaseCompleted { .. })
+        )
+    }
+
+    fn budget_exhausted_tip(events: &[ProcessingEvent]) -> Option<u64> {
+        events.iter().find_map(|e| match e {
+            ProcessingEvent::ScanStatus(ScanStatusEvent::BudgetExhausted { tip_height, .. }) => Some(*tip_height),
+            _ => None,
+        })
+    }
+
+    const FAST_SYNC: ScanMode = ScanMode::FastSync { safety_buffer: 20 };
+    const BACKFILL_TO: u64 = 1520;
+
+    /// Runs `scan` and cancels it once the (slow) block download has been asked for.
+    async fn cancel_during_download(
+        setup: &Setup,
+        token: &CancellationToken,
+        scan: impl Future<Output = Result<(Vec<WalletEvent>, bool), ScanError>>,
+    ) -> bool {
+        let cancel = cancel_once_requested(&setup.server, "/sync_utxos_by_block", 0, token);
+        let (result, _) = tokio::time::timeout(Duration::from_secs(30), async { tokio::join!(scan, cancel) })
+            .await
+            .expect("the scan stops when cancelled");
+        let (_, more_blocks) = result.expect("a cancelled scan is not an error");
+        more_blocks
+    }
+
+    fn slow_download_chain() -> MockChain {
+        let mut chain = MockChain::new(1600);
+        chain.download_delay = Duration::from_millis(500);
+        chain
+    }
+
+    #[tokio::test]
+    async fn a_fast_sync_completes_once_after_both_phases() {
+        let mut setup = setup(1500, 1600).await;
+
+        let (_, more_blocks) = setup
+            .coordinator
+            .run(vec![account(&setup.pool)], "password", FAST_SYNC, 0, None)
+            .await
+            .expect("scan");
+        assert!(!more_blocks);
+        let events = drain(&mut setup.events);
+
+        assert_eq!(terminal_count(&events), 1);
+        let completed = position(&events, |e| {
+            matches!(
+                e,
+                ProcessingEvent::ScanStatus(ScanStatusEvent::Completed { final_height: 1600, .. })
+            )
+        })
+        .expect("completed");
+        assert_eq!(events.iter().filter(|e| is_phase_completed(e)).count(), 2);
+        let last_phase = events.iter().rposition(is_phase_completed).expect("phase completed");
+        assert!(last_phase < completed, "Completed comes after the phases");
+    }
+
+    #[tokio::test]
+    async fn a_fast_sync_past_its_deadline_ends_out_of_budget() {
+        let mut setup = setup(1500, 1600).await;
+        setup.coordinator.deadline = Some(Instant::now());
+
+        let (_, more_blocks) = setup
+            .coordinator
+            .run(vec![account(&setup.pool)], "password", FAST_SYNC, 0, None)
+            .await
+            .expect("scan");
+        assert!(more_blocks);
+        let events = drain(&mut setup.events);
+        assert_eq!(terminal_count(&events), 1);
+        assert_eq!(budget_exhausted_tip(&events), Some(1600));
+    }
+
+    #[tokio::test]
+    async fn a_fast_sync_whose_deadline_passes_at_the_end_of_phase_one_does_not_start_phase_two() {
+        let mut setup = setup(1500, 1600).await;
+        setup.coordinator.deadline = Some(Instant::now());
+        // Phase 1 covers 1501..=1510, one batch; the tip is at 1600.
+        let mode = ScanMode::FastSync { safety_buffer: 90 };
+
+        let (_, more_blocks) = setup
+            .coordinator
+            .run(vec![account(&setup.pool)], "password", mode, 0, None)
+            .await
+            .expect("scan");
+        assert!(more_blocks);
+        let events = drain(&mut setup.events);
+
+        let progress: Vec<u64> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProcessingEvent::ScanStatus(ScanStatusEvent::Progress { current_height, .. }) => Some(*current_height),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(progress, vec![1510], "exactly one batch is scanned");
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                ProcessingEvent::ScanStatus(ScanStatusEvent::FastSyncPhaseStarted {
+                    phase: FastSyncPhase::RecentFullScan,
+                    ..
+                })
+            )),
+            "phase 2 never starts"
+        );
+        assert_eq!(terminal_count(&events), 1);
+        assert_eq!(budget_exhausted_tip(&events), Some(1600));
+    }
+
+    #[tokio::test]
+    async fn a_fast_sync_past_its_deadline_with_phase_one_done_still_scans_a_phase_two_batch() {
+        // Phase 1 ends at 1510, below where the wallet already is.
+        let mut setup = setup(1550, 1600).await;
+        setup.coordinator.deadline = Some(Instant::now());
+        let mode = ScanMode::FastSync { safety_buffer: 90 };
+
+        let (_, more_blocks) = setup
+            .coordinator
+            .run(vec![account(&setup.pool)], "password", mode, 0, None)
+            .await
+            .expect("scan");
+        assert!(more_blocks);
+        let events = drain(&mut setup.events);
+
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ProcessingEvent::ScanStatus(ScanStatusEvent::FastSyncPhaseStarted {
+                phase: FastSyncPhase::RecentFullScan,
+                ..
+            })
+        )));
+        let progress: Vec<u64> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProcessingEvent::ScanStatus(ScanStatusEvent::Progress { current_height, .. }) => Some(*current_height),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(progress, vec![1560], "exactly one phase 2 batch is scanned");
+        assert_eq!(terminal_count(&events), 1);
+        assert_eq!(budget_exhausted_tip(&events), Some(1600));
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_fast_sync_reports_cancelled_once() {
+        let mut setup = setup_chain(1500, slow_download_chain(), 1_000).await;
+        let token = CancellationToken::new();
+
+        let scan = setup.coordinator.run(
+            vec![account(&setup.pool)],
+            "password",
+            FAST_SYNC,
+            0,
+            Some(token.clone()),
+        );
+        assert!(cancel_during_download(&setup, &token, scan).await);
+        let events = drain(&mut setup.events);
+        assert_eq!(terminal_count(&events), 1);
+        assert!(events.iter().any(is_cancelled));
+    }
+
+    #[tokio::test]
+    async fn a_backfill_completes_once_after_its_phase() {
+        let mut setup = setup(1500, 1600).await;
+
+        let (_, more_blocks) = setup
+            .coordinator
+            .run_backfill(vec![account(&setup.pool)], "password", BACKFILL_TO, 0, None)
+            .await
+            .expect("backfill");
+        assert!(!more_blocks);
+        let events = drain(&mut setup.events);
+
+        assert_eq!(terminal_count(&events), 1);
+        // The mock chain serves whole pages, so the scan can end past BACKFILL_TO.
+        let completed = position(&events, |e| {
+            matches!(
+                e,
+                ProcessingEvent::ScanStatus(ScanStatusEvent::Completed { final_height, .. }) if *final_height >= BACKFILL_TO
+            )
+        })
+        .expect("completed");
+        let phase = position(&events, is_phase_completed).expect("phase completed");
+        assert!(phase < completed, "Completed comes after the phase");
+    }
+
+    #[tokio::test]
+    async fn a_backfill_past_its_deadline_ends_out_of_budget() {
+        let mut setup = setup(1500, 1600).await;
+        setup.coordinator.deadline = Some(Instant::now());
+
+        let (_, more_blocks) = setup
+            .coordinator
+            .run_backfill(vec![account(&setup.pool)], "password", BACKFILL_TO, 0, None)
+            .await
+            .expect("backfill");
+        assert!(more_blocks);
+        let events = drain(&mut setup.events);
+        assert_eq!(terminal_count(&events), 1);
+        assert_eq!(budget_exhausted_tip(&events), Some(BACKFILL_TO));
+        assert!(!events.iter().any(is_phase_completed));
+    }
+
+    #[tokio::test]
+    async fn a_backfill_whose_deadline_passes_on_its_last_batch_still_finishes() {
+        let mut setup = setup(1500, 1600).await;
+        setup.coordinator.deadline = Some(Instant::now());
+        // Inside the first 10-block batch from the birthday (1450).
+        let backfill_to = 1455;
+
+        let (_, more_blocks) = setup
+            .coordinator
+            .run_backfill(vec![account(&setup.pool)], "password", backfill_to, 0, None)
+            .await
+            .expect("backfill");
+        assert!(!more_blocks);
+        let events = drain(&mut setup.events);
+
+        assert_eq!(terminal_count(&events), 1);
+        let phase = position(&events, is_phase_completed).expect("the backfill's resolve step and phase end run");
+        let completed = position(&events, |e| {
+            matches!(e, ProcessingEvent::ScanStatus(ScanStatusEvent::Completed { .. }))
+        })
+        .expect("completed");
+        assert!(phase < completed);
+    }
+
+    #[tokio::test]
+    async fn a_full_scan_whose_deadline_passes_on_its_last_batch_still_runs_the_post_scan_monitor() {
+        let mut setup = setup(1500, 1505).await;
+        setup.coordinator.deadline = Some(Instant::now());
+
+        let (_, more_blocks) = setup
+            .coordinator
+            .run(vec![account(&setup.pool)], "password", ScanMode::Full, 0, None)
+            .await
+            .expect("scan");
+        assert!(!more_blocks);
+        let events = drain(&mut setup.events);
+
+        assert_eq!(terminal_count(&events), 1);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ProcessingEvent::ScanStatus(ScanStatusEvent::Completed { final_height: 1505, .. })
+        )));
+        assert_eq!(
+            displayed_status(&setup.pool),
+            TransactionDisplayStatus::Confirmed,
+            "the post-scan monitor ran"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_partial_scan_whose_deadline_passes_on_its_block_limit_still_runs_the_post_scan_monitor() {
+        let mut setup = setup(1500, 1600).await;
+        setup.coordinator.deadline = Some(Instant::now());
+
+        let (_, more_blocks) = setup
+            .coordinator
+            .run(
+                vec![account(&setup.pool)],
+                "password",
+                ScanMode::Partial { max_blocks: 10 },
+                0,
+                None,
+            )
+            .await
+            .expect("scan");
+        assert!(more_blocks, "the scan stopped before the tip");
+        let events = drain(&mut setup.events);
+
+        assert_eq!(terminal_count(&events), 1);
+        assert_ne!(displayed_status(&setup.pool), TransactionDisplayStatus::Pending);
+        let updated = position(&events, |e| matches!(e, ProcessingEvent::TransactionsUpdated(_)))
+            .expect("the post-scan monitor must emit the updated transaction");
+        let exhausted = position(&events, |e| {
+            matches!(
+                e,
+                ProcessingEvent::ScanStatus(ScanStatusEvent::BudgetExhausted { tip_height: 1600, .. })
+            )
+        })
+        .expect("budget exhausted");
+        assert!(updated < exhausted);
+    }
+
+    #[tokio::test]
+    async fn a_full_scan_of_accounts_at_different_heights_takes_both_to_the_tip() {
+        let mut setup = setup(1500, 1600).await;
+        let accounts = {
+            let conn = setup.pool.get().expect("conn");
+            let wallet = WalletType::SeedWords(SeedWordsWallet::construct_new(CipherSeed::random()).unwrap());
+            create_account(&conn, "second", &wallet, "password").unwrap();
+            let second = get_account_by_name(&conn, "second").unwrap().unwrap();
+            insert_scanned_tip_block(&conn, second.id, 1550, &block_hash(1550)).expect("tip");
+            vec![get_account_by_name(&conn, "default").unwrap().unwrap(), second]
+        };
+        let account_ids: Vec<i64> = accounts.iter().map(|account| account.id).collect();
+
+        let (_, more_blocks) = setup
+            .coordinator
+            .run(accounts, "password", ScanMode::Full, 0, None)
+            .await
+            .expect("scan");
+        assert!(!more_blocks);
+        let events = drain(&mut setup.events);
+
+        assert_eq!(terminal_count(&events), 2, "one terminal event per account");
+        for account_id in account_ids {
+            let completed_at_tip = events
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        ProcessingEvent::ScanStatus(ScanStatusEvent::Completed { account_id: id, final_height: 1600, .. })
+                            if *id == account_id
+                    )
+                })
+                .count();
+            assert_eq!(completed_at_tip, 1, "account {account_id} completes at the tip");
+            assert_eq!(max_tip_height(&setup.pool, account_id), 1600);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_backfill_reports_cancelled_once() {
+        let mut setup = setup_chain(1500, slow_download_chain(), 1_000).await;
+        let token = CancellationToken::new();
+
+        let scan = setup.coordinator.run_backfill(
+            vec![account(&setup.pool)],
+            "password",
+            BACKFILL_TO,
+            0,
+            Some(token.clone()),
+        );
+        assert!(cancel_during_download(&setup, &token, scan).await);
+        let events = drain(&mut setup.events);
+        assert_eq!(terminal_count(&events), 1);
+        assert!(events.iter().any(is_cancelled));
+    }
+
+    #[tokio::test]
+    async fn a_bounded_event_channel_delivers_every_event_in_order_to_a_slow_consumer() {
+        let setup = setup(1500, 1550).await;
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+        let coordinator = new_coordinator(
+            &setup.pool,
+            &setup.server,
+            EventChannel::Bounded { sender, cancel: None },
+            1_000,
+        );
+
+        let scan = async {
+            let result = coordinator
+                .run(vec![account(&setup.pool)], "password", ScanMode::Full, 0, None)
+                .await;
+            drop(coordinator);
+            result
+        };
+        let consume = async {
+            let mut events = Vec::new();
+            while let Some(event) = receiver.recv().await {
+                assert!(receiver.len() <= 2, "the channel holds at most its capacity");
+                events.push(event);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            events
+        };
+        let (result, events) = tokio::time::timeout(Duration::from_secs(30), async { tokio::join!(scan, consume) })
+            .await
+            .expect("the scan finishes");
+        result.expect("scan");
+
+        let heights: Vec<u64> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProcessingEvent::ScanStatus(ScanStatusEvent::Progress { current_height, .. }) => Some(*current_height),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(heights, vec![1510, 1520, 1530, 1540, 1550]);
+        let blocks = events
+            .iter()
+            .filter(|e| matches!(e, ProcessingEvent::BlockProcessed(_)))
+            .count();
+        assert_eq!(blocks, 50, "every block is reported");
+        assert!(matches!(
+            events.last(),
+            Some(ProcessingEvent::ScanStatus(ScanStatusEvent::Completed {
+                final_height: 1550,
+                ..
+            }))
+        ));
+        assert_eq!(terminal_count(&events), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_scan_blocked_on_a_full_event_channel_stops_it() {
+        let setup = setup(1500, 1600).await;
+        let token = CancellationToken::new();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let coordinator = new_coordinator(
+            &setup.pool,
+            &setup.server,
+            EventChannel::Bounded {
+                sender,
+                cancel: Some(token.clone()),
+            },
+            1_000,
+        );
+
+        let scan = async {
+            let result = coordinator
+                .run(
+                    vec![account(&setup.pool)],
+                    "password",
+                    ScanMode::Full,
+                    0,
+                    Some(token.clone()),
+                )
+                .await;
+            (result, std::time::Instant::now())
+        };
+        // Read nothing until the channel is full and the scan waits on it, then
+        // cancel and read every event up to the terminal one.
+        let cancel_then_drain = async {
+            while receiver.capacity() > 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            token.cancel();
+            let cancelled_at = std::time::Instant::now();
+            let mut events = Vec::new();
+            while let Some(event) = receiver.recv().await {
+                let terminal = is_cancelled(&event);
+                events.push(event);
+                if terminal {
+                    break;
+                }
+            }
+            (cancelled_at, events)
+        };
+        let ((result, stopped_at), (cancelled_at, mut events)) =
+            tokio::time::timeout(Duration::from_secs(30), async { tokio::join!(scan, cancel_then_drain) })
+                .await
+                .expect("the scan stops when cancelled");
+        let (_, more_blocks) = result.expect("a cancelled scan is not an error");
+        assert!(more_blocks);
+        assert!(
+            stopped_at.duration_since(cancelled_at) < Duration::from_secs(2),
+            "cancelling must not wait for the block download or the full channel"
+        );
+        while let Ok(event) = receiver.try_recv() {
+            events.push(event);
+        }
+        assert_eq!(events.iter().filter(|e| is_cancelled(e)).count(), 1);
+        assert_eq!(terminal_count(&events), 1);
+        assert!(
+            max_tip_height(&setup.pool, setup.account_id) <= 1510,
+            "the scan stops within one batch"
+        );
     }
 
     #[tokio::test]
@@ -1905,17 +2713,15 @@ mod tests {
         assert_ne!(displayed_status(&setup.pool), TransactionDisplayStatus::Pending);
         let updated = position(&events, |e| matches!(e, ProcessingEvent::TransactionsUpdated(_)))
             .expect("the post-scan monitor must emit the updated transaction");
-        let paused = position(&events, |e| {
+        let exhausted = position(&events, |e| {
             matches!(
                 e,
-                ProcessingEvent::ScanStatus(ScanStatusEvent::Paused {
-                    reason: PauseReason::MaxBlocksReached { .. },
-                    ..
-                })
+                ProcessingEvent::ScanStatus(ScanStatusEvent::BudgetExhausted { tip_height: 1600, .. })
             )
         })
-        .expect("paused");
-        assert!(updated < paused, "monitor events come before the pause");
+        .expect("budget exhausted");
+        assert!(updated < exhausted, "monitor events come before the terminal event");
+        assert_eq!(terminal_count(&events), 1);
     }
 
     /// Records a send for `account_id`, in `Broadcast` with a kernel the node can
@@ -2023,14 +2829,24 @@ mod tests {
         matches!(event, ProcessingEvent::ScanStatus(ScanStatusEvent::Waiting { .. }))
     }
 
-    fn is_cancelled(event: &ProcessingEvent) -> bool {
-        matches!(
-            event,
-            ProcessingEvent::ScanStatus(ScanStatusEvent::Paused {
-                reason: PauseReason::Cancelled,
-                ..
+    fn terminal_count(events: &[ProcessingEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    ProcessingEvent::ScanStatus(
+                        ScanStatusEvent::Completed { .. }
+                            | ScanStatusEvent::Cancelled { .. }
+                            | ScanStatusEvent::BudgetExhausted { .. }
+                    )
+                )
             })
-        )
+            .count()
+    }
+
+    fn is_cancelled(event: &ProcessingEvent) -> bool {
+        matches!(event, ProcessingEvent::ScanStatus(ScanStatusEvent::Cancelled { .. }))
     }
 
     /// Runs a continuous scan, handing each event to `on_event` until it returns
@@ -2090,16 +2906,54 @@ mod tests {
             )
         })
         .expect("progress up to the tip");
-        let completed = position(&events, |e| {
-            matches!(
-                e,
-                ProcessingEvent::ScanStatus(ScanStatusEvent::Completed { final_height: 1505, .. })
-            )
-        })
-        .expect("caught up");
         let waiting = position(&events, is_waiting).expect("waiting for the next poll");
-        let paused = position(&events, is_cancelled).expect("paused on cancel");
-        assert!(progress < completed && completed < waiting && waiting < paused);
+        let cancelled = position(&events, is_cancelled).expect("cancelled");
+        assert!(progress < waiting && waiting < cancelled);
+        // Caught up is `Waiting`; the only terminal event is the cancel.
+        assert_eq!(terminal_count(&events), 1);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ProcessingEvent::ScanStatus(ScanStatusEvent::Cancelled {
+                    last_scanned_height: 1505,
+                    ..
+                })
+            )),
+            "a cancel during the poll wait reports the tip as scanned"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_continuous_scan_past_its_deadline_ends_out_of_budget_not_completed() {
+        let mut setup = setup(1500, 1505).await;
+        setup.coordinator.deadline = Some(Instant::now() + POLL_INTERVAL);
+
+        let (_, more_blocks) = tokio::time::timeout(
+            Duration::from_secs(30),
+            setup.coordinator.run(
+                vec![account(&setup.pool)],
+                "password",
+                ScanMode::Continuous {
+                    poll_interval: POLL_INTERVAL * 10,
+                },
+                0,
+                None,
+            ),
+        )
+        .await
+        .expect("the deadline stops the continuous scan")
+        .expect("scan");
+        assert!(more_blocks);
+        let events = drain(&mut setup.events);
+        assert_eq!(terminal_count(&events), 1);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ProcessingEvent::ScanStatus(ScanStatusEvent::BudgetExhausted {
+                last_scanned_height: 1505,
+                tip_height: 1505,
+                ..
+            })
+        )));
     }
 
     #[tokio::test]
@@ -2162,7 +3016,7 @@ mod tests {
     }
 
     fn continuous_scan<'a>(
-        coordinator: &'a ScanCoordinator<ChannelEventSender>,
+        coordinator: &'a ScanCoordinator,
         pool: &SqlitePool,
         token: &CancellationToken,
     ) -> impl Future<Output = Result<(Vec<WalletEvent>, bool), ScanError>> + 'a {
@@ -2201,6 +3055,7 @@ mod tests {
 
         let events = drain(&mut setup.events);
         assert!(events.iter().any(is_cancelled));
+        assert_eq!(terminal_count(&events), 1);
         let conn = setup.pool.get().expect("conn");
         let tips = get_scanned_tip_blocks_by_account(&conn, setup.account_id).expect("tips");
         assert_eq!(
@@ -2305,8 +3160,16 @@ mod tests {
             cancelled_at.elapsed() < Duration::from_secs(2),
             "cancelling must not wait for the startup reorg check"
         );
-        // No account was prepared, so none has a height to report.
-        assert!(!drain(&mut setup.events).iter().any(is_cancelled));
+        // The account is reported at the last block stored for it.
+        let events = drain(&mut setup.events);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ProcessingEvent::ScanStatus(ScanStatusEvent::Cancelled {
+                last_scanned_height: 1500,
+                ..
+            })
+        )));
+        assert_eq!(terminal_count(&events), 1);
     }
 
     fn first_reorg(events: &[ProcessingEvent]) -> &ReorgDetectedEvent {

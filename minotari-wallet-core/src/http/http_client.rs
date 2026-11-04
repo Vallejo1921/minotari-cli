@@ -6,7 +6,7 @@
 
 use std::time::{Duration, Instant};
 
-use log::debug;
+use log::{debug, trace};
 use reqwest::Method;
 use serde::de::DeserializeOwned;
 use tokio::sync::RwLock;
@@ -176,11 +176,13 @@ impl HttpClient {
         let start = Instant::now();
         let url = self.base_url.join(path)?;
 
+        // The query string can carry kernel signatures and commitments.
         debug!(
             method = method.as_str(),
-            url:% = url;
+            path = url.path();
             "HTTP: Sending request"
         );
+        trace!(url:% = url; "HTTP: Request URL");
 
         let req = match method {
             Method::GET => self.client.get(url),

@@ -69,7 +69,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Result, anyhow};
 use chrono::Utc;
-use log::{info, warn};
+use log::{info, trace, warn};
 use r2d2::PooledConnection;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, TransactionBehavior};
@@ -579,24 +579,23 @@ impl TransactionMonitor {
             let outcome = self
                 .rebroadcast(wallet_client, db_pool, account_id, &tx, &mut result)
                 .await;
-            Self::skip_on_node_error(outcome, &tx)?;
+            Self::skip_on_node_error(outcome)?;
         }
         Ok(result)
     }
 
     /// Lets the monitor carry on with the next transaction after a failed node
-    /// request for `tx`.
+    /// request for it.
     ///
-    /// The failure is logged and `tx` is left as it is; the next pass asks the
+    /// The failure is logged and the transaction is left as it is; the next pass asks the
     /// node again. One transaction the node cannot answer for must not stop every
     /// other transaction and account from being monitored. Any other error (a
     /// database failure) is returned.
-    fn skip_on_node_error(outcome: Result<()>, tx: &CompletedTransaction) -> Result<()> {
+    fn skip_on_node_error(outcome: Result<()>) -> Result<()> {
         match outcome {
             Err(e) if e.downcast_ref::<NodeRequestError>().is_some() => {
                 warn!(
                     target: "audit",
-                    id = tx.id.to_string().as_str(),
                     error:% = e;
                     "Base node request failed; leaving the transaction for the next pass"
                 );
@@ -634,11 +633,11 @@ impl TransactionMonitor {
             let Some(transaction) = Self::decode_transaction(&tx) else {
                 continue;
             };
-            let response = match Self::query_transaction(wallet_client, &tx, &transaction).await {
+            let response = match Self::query_transaction(wallet_client, &transaction).await {
                 Ok(Some(response)) => response,
                 Ok(None) => continue,
                 Err(e) => {
-                    Self::skip_on_node_error(Err(e), &tx)?;
+                    Self::skip_on_node_error(Err(e))?;
                     continue;
                 },
             };
@@ -656,7 +655,6 @@ impl TransactionMonitor {
                     let Ok(mined_block_hash) = FixedHash::try_from(mined_block_hash) else {
                         warn!(
                             target: "audit",
-                            id = tx.id.to_string().as_str();
                             "Node reported a malformed block hash for a mined transaction; leaving it to the scan"
                         );
                         continue;
@@ -670,7 +668,6 @@ impl TransactionMonitor {
                     {
                         warn!(
                             target: "audit",
-                            id = tx.id.to_string().as_str(),
                             height = mined_height;
                             "Node reports the transaction mined in a block the wallet did not scan; leaving it to the scan"
                         );
@@ -678,8 +675,12 @@ impl TransactionMonitor {
                     }
                     info!(
                         target: "audit",
-                        id = tx.id.to_string().as_str(),
                         height = mined_height;
+                        "Transaction mined in a block the scan has already passed (unconfirmed)"
+                    );
+                    trace!(
+                        target: "audit",
+                        id = tx.id.to_string().as_str();
                         "Transaction mined in a block the scan has already passed (unconfirmed)"
                     );
                     let event = WalletEvent {
@@ -706,7 +707,8 @@ impl TransactionMonitor {
                     result.wallet_events.push(event);
                 },
                 TxLocation::NotStored | TxLocation::None => {
-                    info!(
+                    info!(target: "audit", "Broadcast transaction is not in the mempool");
+                    trace!(
                         target: "audit",
                         id = tx.id.to_string().as_str();
                         "Broadcast transaction is not in the mempool"
@@ -714,7 +716,7 @@ impl TransactionMonitor {
                     let outcome = self
                         .rebroadcast(wallet_client, db_pool, account_id, &tx, &mut result)
                         .await;
-                    Self::skip_on_node_error(outcome, &tx)?;
+                    Self::skip_on_node_error(outcome)?;
                 },
             }
         }
@@ -756,7 +758,8 @@ impl TransactionMonitor {
         // and leaves the transaction as it is.
         match Self::broadcast_transaction(wallet_client, transaction).await? {
             SubmitOutcome::Accepted => {
-                info!(
+                info!(target: "audit", "Rebroadcasting transaction");
+                trace!(
                     target: "audit",
                     id = tx.id.to_string().as_str();
                     "Rebroadcasting transaction"
@@ -808,7 +811,6 @@ impl TransactionMonitor {
                 let attempts = tx.broadcast_attempts.saturating_add(1);
                 warn!(
                     target: "audit",
-                    id = tx.id.to_string().as_str(),
                     attempts = attempts,
                     reason:% = reason;
                     "Transaction not accepted on rebroadcast; will try again"
@@ -839,7 +841,6 @@ impl TransactionMonitor {
                 if let Some(event) = stalled_event {
                     warn!(
                         target: "audit",
-                        id = tx.id.to_string().as_str();
                         "Transaction stalled: the node keeps not accepting it"
                     );
                     result.wallet_events.push(event);
@@ -877,15 +878,18 @@ impl TransactionMonitor {
                 let (Some(mined_block_hash), Some(sent_output_hash)) = (mined_block_hash, sent_output_hash) else {
                     warn!(
                         target: "audit",
-                        id = tx.id.to_string().as_str();
                         "Mined transaction has a missing or malformed block or sent output hash; cannot confirm it"
                     );
                     continue;
                 };
                 info!(
                     target: "audit",
-                    id = tx.id.to_string().as_str(),
                     confirmations = confirmations;
+                    "Transaction confirmed"
+                );
+                trace!(
+                    target: "audit",
+                    id = tx.id.to_string().as_str();
                     "Transaction confirmed"
                 );
 
@@ -923,7 +927,6 @@ impl TransactionMonitor {
             Err(e) => {
                 warn!(
                     target: "audit",
-                    id = tx.id.to_string().as_str(),
                     error:% = e;
                     "Cannot decode stored transaction; skipping it"
                 );
@@ -965,13 +968,11 @@ impl TransactionMonitor {
     /// kernel cannot be looked up; it is logged and `None` is returned.
     async fn query_transaction(
         wallet_client: &WalletHttpClient,
-        tx: &CompletedTransaction,
         transaction: &Transaction,
     ) -> Result<Option<TxQueryResponse>> {
         let Some(kernel) = transaction.body().kernels().first() else {
             warn!(
                 target: "audit",
-                id = tx.id.to_string().as_str();
                 "Stored transaction has no kernel; skipping it"
             );
             return Ok(None);

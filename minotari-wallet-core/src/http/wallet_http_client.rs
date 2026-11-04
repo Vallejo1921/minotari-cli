@@ -32,7 +32,7 @@
 
 use std::time::Duration;
 
-use log::{debug, info, warn};
+use log::{debug, info, trace, warn};
 use reqwest::Method;
 use serde::Deserialize;
 use tari_common_types::types::FixedHash;
@@ -461,7 +461,7 @@ impl WalletHttpClient {
     ) -> Result<TxQueryResponse, anyhow::Error> {
         let excess_sig_nonce_hex = to_hex(excess_sig_nonce);
         let excess_sig_hex = to_hex(excess_sig);
-        debug!(
+        trace!(
             nonce = &*excess_sig_nonce_hex,
             sig = &*excess_sig_hex;
             "HTTP: Querying transaction"
