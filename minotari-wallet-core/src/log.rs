@@ -71,4 +71,94 @@ mod tests {
         assert_eq!(sanitize_node_text(&long).chars().count(), 256);
         assert_eq!(sanitize_node_text("DoubleSpend"), "DoubleSpend");
     }
+
+    /// The `.rs` files under `dir`, recursively.
+    fn rust_files(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                rust_files(&path, files);
+                continue;
+            }
+            if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
+        }
+    }
+
+    /// The text of the macro call whose arguments start at `args`, up to its closing parenthesis.
+    fn macro_args(args: &str) -> &str {
+        let mut depth = 1;
+        for (index, c) in args.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {},
+            }
+            if depth == 0 {
+                return &args[..index];
+            }
+        }
+        args
+    }
+
+    #[test]
+    fn no_log_above_trace_names_a_payment_reference_or_wallet_name() {
+        let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        rust_files(&crate_dir.join("src"), &mut files);
+        rust_files(&crate_dir.join("../minotari-scanning/src"), &mut files);
+        rust_files(&crate_dir.join("../minotari/src"), &mut files);
+
+        let forbidden = ["payref", "payment_ref", "friendly_name"];
+        let mut found = Vec::new();
+        for file in &files {
+            let source = std::fs::read_to_string(file).expect("read source");
+            for level in ["debug", "info", "warn", "error"] {
+                let call = format!("{level}!(");
+                for (start, _) in source.match_indices(&call) {
+                    let preceding = source[..start].chars().last();
+                    if preceding.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                        continue;
+                    }
+                    let args = macro_args(&source[start + call.len()..]).to_lowercase();
+                    if forbidden.iter().any(|word| args.contains(word)) {
+                        let line = source[..start].lines().count() + 1;
+                        found.push(format!("{}:{line}", file.display()));
+                    }
+                }
+            }
+        }
+        assert!(found.is_empty(), "log these at trace! or drop the field: {found:#?}");
+    }
+
+    #[test]
+    fn key_audit_events_are_logged_at_info() {
+        let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        rust_files(&crate_dir.join("src"), &mut files);
+        rust_files(&crate_dir.join("../minotari/src"), &mut files);
+        let mut info_audit_calls = Vec::new();
+        for file in &files {
+            let source = std::fs::read_to_string(file).expect("read source");
+            for (start, _) in source.match_indices("info!(") {
+                let args = macro_args(&source[start + "info!(".len()..]);
+                if args.contains("target: \"audit\"") {
+                    info_audit_calls.push(args.to_string());
+                }
+            }
+        }
+
+        for event in [
+            "DB: Deleting account and all associated data",
+            "API: Burn transaction recorded",
+            "Burn transaction broadcasted",
+            "Transaction accepted by network",
+        ] {
+            assert!(
+                info_audit_calls.iter().any(|args| args.contains(event)),
+                "the audit event {event:?} must stay at info"
+            );
+        }
+    }
 }

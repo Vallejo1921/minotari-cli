@@ -3,7 +3,7 @@ use std::str::FromStr;
 
 use crate::db::error::WalletDbResult;
 use chrono::{DateTime, Utc};
-use log::{debug, info, warn};
+use log::{debug, info, trace, warn};
 use rusqlite::{Connection, OptionalExtension, Row, named_params};
 use tari_common_types::transaction::TxId;
 
@@ -98,7 +98,7 @@ pub fn create_completed_transaction(
     sent_output_hash: Option<String>,
     tx_id: TxId,
 ) -> WalletDbResult<()> {
-    debug!(
+    trace!(
         account_id = account_id,
         pending_id = pending_tx_id;
         "DB: Creating completed transaction"
@@ -141,8 +141,12 @@ pub fn create_completed_transaction(
 
     info!(
         target: "audit",
+        account_id = account_id;
+        "DB: Transaction Completed"
+    );
+    trace!(
+        target: "audit",
         id = id.to_string().as_str(),
-        account_id = account_id,
         pending_id = pending_tx_id;
         "DB: Transaction Completed"
     );
@@ -243,7 +247,7 @@ pub fn update_completed_transaction_status(
     tx_id: TxId,
     status: CompletedTransactionStatus,
 ) -> WalletDbResult<()> {
-    debug!(
+    trace!(
         id = tx_id.to_string().as_str(),
         status:% = status;
         "DB: Updating completed tx status"
@@ -285,8 +289,12 @@ pub fn mark_completed_transaction_as_broadcasted(
     let id = tx_id.to_string();
     info!(
         target: "audit",
-        id = id.as_str(),
         attempts = attempts;
+        "DB: Marking completed tx as broadcasted"
+    );
+    trace!(
+        target: "audit",
+        id = id.as_str();
         "DB: Marking completed tx as broadcasted"
     );
 
@@ -320,8 +328,12 @@ pub fn mark_completed_transaction_as_mined_unconfirmed(
     let id = tx_id.to_string();
     info!(
         target: "audit",
-        id = id.as_str(),
         height = block_height;
+        "DB: Transaction Mined (Unconfirmed)"
+    );
+    trace!(
+        target: "audit",
+        id = id.as_str();
         "DB: Transaction Mined (Unconfirmed)"
     );
 
@@ -415,8 +427,12 @@ pub fn mark_completed_transaction_as_confirmed(
     let id = tx_id.to_string();
     info!(
         target: "audit",
-        id = id.as_str(),
         height = confirmation_height;
+        "DB: Transaction Confirmed"
+    );
+    trace!(
+        target: "audit",
+        id = id.as_str();
         "DB: Transaction Confirmed"
     );
 
@@ -444,7 +460,6 @@ pub fn mark_completed_transaction_as_confirmed(
 pub fn revert_completed_transaction_to_completed(conn: &Connection, tx_id: TxId) -> WalletDbResult<()> {
     warn!(
         target: "audit",
-        id = tx_id.to_string().as_str();
         "DB: Reverting transaction to completed state (Reorg)"
     );
 
@@ -524,9 +539,7 @@ pub fn mark_completed_transaction_as_rejected(
     tx_id: TxId,
     reject_reason: &str,
 ) -> WalletDbResult<()> {
-    let id = tx_id.to_string();
     warn!(
-        id = id.as_str(),
         reason = reject_reason;
         "DB: Transaction Rejected"
     );
@@ -566,7 +579,6 @@ pub fn mark_completed_transaction_as_rejected_in_block(
 ) -> WalletDbResult<()> {
     warn!(
         target: "audit",
-        id = tx_id.to_string().as_str(),
         height = block_height,
         reason = reject_reason;
         "DB: Transaction Rejected (inputs spent in a block)"
@@ -740,7 +752,7 @@ pub fn get_completed_transaction_by_payref(
     account_id: i64,
     payref: &str,
 ) -> WalletDbResult<Option<CompletedTransaction>> {
-    debug!(
+    trace!(
         account_id = account_id,
         payref = payref;
         "DB: Fetching completed transaction by payref"

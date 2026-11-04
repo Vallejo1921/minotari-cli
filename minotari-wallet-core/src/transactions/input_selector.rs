@@ -42,7 +42,7 @@
 //! println!("Fee: {}", selection.fee());
 //! ```
 
-use log::{debug, info, warn};
+use log::{debug, info, trace, warn};
 use rusqlite::Connection;
 use tari_common::configuration::Network;
 use tari_common_types::types::{ComAndPubSignature, FixedHash};
@@ -523,12 +523,12 @@ impl InputSelector {
         info!(
             target: "audit",
             account_id = self.account_id,
-            reservation_id = reservation_id,
             amount = &*mask_amount(amount),
             fee = &*mask_amount(fee),
             input_count = input_count;
             "Send-all amount worked out"
         );
+        trace!(target: "audit", reservation_id = reservation_id; "Send-all reservation");
     }
 
     /// Selects the spendable, unlocked outputs for a send-all to one recipient.

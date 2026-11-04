@@ -69,7 +69,8 @@ async fn read_body_capped(response: reqwest::Response, what: &str) -> WalletResu
     loop {
         let chunk = response.chunk().await.map_err(|e| {
             WalletError::ScanningError(crate::errors::ScanningError::blockchain_connection_failed(&format!(
-                "Failed to read {what} response body: {e}"
+                "Failed to read {what} response body: {}",
+                e.without_url()
             )))
         })?;
         let Some(chunk) = chunk else { break };
@@ -96,9 +97,33 @@ async fn read_body_text_capped(response: reqwest::Response, what: &str) -> Walle
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// Best-effort read of an error response body, for logging only.
-async fn read_error_body(response: reqwest::Response) -> String {
-    read_body_text_capped(response, "error").await.unwrap_or_default()
+/// Most bytes of an error response body read for logging.
+const MAX_ERROR_BODY_BYTES: usize = 4 * 1024;
+/// Most characters of node-supplied text put in a log line.
+const MAX_NODE_TEXT_CHARS: usize = 256;
+
+/// Best-effort read of an error response body, for logging only: at most
+/// [`MAX_ERROR_BODY_BYTES`] are read, and the text is sanitised.
+async fn read_error_body(mut response: reqwest::Response) -> String {
+    let mut body = Vec::new();
+    while body.len() < MAX_ERROR_BODY_BYTES {
+        match response.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            _ => break,
+        }
+    }
+    body.truncate(MAX_ERROR_BODY_BYTES);
+    sanitize_node_text(&String::from_utf8_lossy(&body))
+}
+
+/// Node-supplied text made safe to log: control characters are dropped, so the
+/// node cannot forge log lines, and at most [`MAX_NODE_TEXT_CHARS`] are kept.
+/// The same rule as `minotari_wallet_core::log::sanitize_node_text`.
+fn sanitize_node_text(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_NODE_TEXT_CHARS)
+        .collect()
 }
 
 /// HTTP client for connecting to Tari base node
@@ -178,7 +203,7 @@ where
         if response.is_err() {
             let body = match response {
                 Ok(resp) => read_error_body(resp).await,
-                Err(e) => e.to_string(),
+                Err(e) => e.without_url().to_string(),
             };
             warn!("Connection test failed, response body: {body}");
             return Err(WalletError::ScanningError(
@@ -279,7 +304,8 @@ where
             .await
             .map_err(|e| {
                 WalletError::ScanningError(crate::errors::ScanningError::blockchain_connection_failed(&format!(
-                    "HTTP request failed: {e}"
+                    "HTTP request failed: {}",
+                    e.without_url()
                 )))
             })?;
 
@@ -315,7 +341,8 @@ where
             .await
             .map_err(|e| {
                 WalletError::ScanningError(crate::errors::ScanningError::blockchain_connection_failed(&format!(
-                    "HTTP request failed: {e}"
+                    "HTTP request failed: {}",
+                    e.without_url()
                 )))
             })?;
 
@@ -330,7 +357,11 @@ where
 
         let body_text = read_body_text_capped(response, "get_utxos_by_block").await?;
         let sync_response: GetUtxosByBlockResponse = serde_json::from_str(&body_text).map_err(|e| {
-            warn!("Failed to parse response body: {}", body_text);
+            warn!(
+                "Failed to parse response body ({} bytes): {}",
+                body_text.len(),
+                sanitize_node_text(&body_text)
+            );
             WalletError::ScanningError(crate::errors::ScanningError::blockchain_connection_failed(&format!(
                 "Failed to parse response: {e}"
             )))
@@ -532,7 +563,8 @@ where
         // Native implementation using reqwest
         let response = self.client.get(&url).send().await.map_err(|e| {
             WalletError::ScanningError(crate::errors::ScanningError::blockchain_connection_failed(&format!(
-                "HTTP request failed: {e}"
+                "HTTP request failed: {}",
+                e.without_url()
             )))
         })?;
 
@@ -548,7 +580,11 @@ where
         let body_text = read_body_text_capped(response, "get_tip_info").await?;
 
         let tip_response: HttpTipInfoResponse = serde_json::from_str(&body_text).map_err(|e| {
-            warn!("Failed to parse response body: {}", body_text);
+            warn!(
+                "Failed to parse response body ({} bytes): {}",
+                body_text.len(),
+                sanitize_node_text(&body_text)
+            );
             WalletError::ScanningError(crate::errors::ScanningError::blockchain_connection_failed(&format!(
                 "Failed to parse response: {e}"
             )))
@@ -571,7 +607,8 @@ where
 
         let response = self.client.get(&url).send().await.map_err(|e| {
             WalletError::ScanningError(crate::errors::ScanningError::blockchain_connection_failed(&format!(
-                "HTTP request failed: {e}"
+                "HTTP request failed: {}",
+                e.without_url()
             )))
         })?;
 
@@ -590,7 +627,11 @@ where
         let body = read_body_text_capped(response, "get_header_by_height").await?;
 
         let header_response: HttpBlockHeader = serde_json::from_str(&body).map_err(|e| {
-            warn!("Failed to parse response body: {}", body);
+            warn!(
+                "Failed to parse response body ({} bytes): {}",
+                body.len(),
+                sanitize_node_text(&body)
+            );
             WalletError::ScanningError(crate::errors::ScanningError::blockchain_connection_failed(&format!(
                 "Failed to parse response: {e}"
             )))
@@ -691,11 +732,7 @@ where
         let thread_count = self.thread_count;
         let processing_scanner = self.clone();
         tokio::spawn(async move {
-            let processing_pool = match rayon::ThreadPoolBuilder::new()
-                .num_threads(thread_count)
-                .build()
-                .map_err(|e| WalletError::ConfigurationError(format!("Failed to build thread pool: {e}")))
-            {
+            let processing_pool = match processing_pool(thread_count) {
                 Ok(pool) => pool,
                 Err(e) => {
                     let _unused = send_download.send(Err(e)).await.inspect_err(|e| {
@@ -958,5 +995,32 @@ where
                 },
             }
         }
+    }
+}
+
+/// The rayon pool that detects wallet outputs, with `thread_count` threads.
+fn processing_pool(thread_count: usize) -> WalletResult<rayon::ThreadPool> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(thread_count)
+        .build()
+        .map_err(|e| WalletError::ConfigurationError(format!("Failed to build thread pool: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_processing_thread_gives_a_pool_of_one_thread() {
+        let pool = processing_pool(1).expect("pool");
+        assert_eq!(pool.current_num_threads(), 1);
+    }
+
+    #[test]
+    fn node_text_is_logged_without_control_characters_and_truncated() {
+        let forged = format!("bad\n2026-11-03 INFO audit: forged{}", "x".repeat(1_000));
+        let clean = sanitize_node_text(&forged);
+        assert!(!clean.chars().any(char::is_control));
+        assert_eq!(clean.chars().count(), MAX_NODE_TEXT_CHARS);
     }
 }

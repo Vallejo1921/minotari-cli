@@ -226,7 +226,6 @@ pub fn insert_unconfirmed_change_output(
     info!(
         target: "audit",
         account_id = account_id,
-        request_id = pending_tx_id,
         value = &*mask_amount(output.value());
         "DB: Inserting unconfirmed change output"
     );
@@ -482,7 +481,6 @@ pub fn soft_delete_unconfirmed_change_output(conn: &Connection, created_by_reque
     if deleted > 0 {
         info!(
             target: "audit",
-            request_id = created_by_request_id;
             "DB: Soft deleted unconfirmed change output"
         );
     }
@@ -591,7 +589,6 @@ pub fn restore_change_of_rejected_send(
 
     info!(
         target: "audit",
-        request_id = request_id.as_str();
         "DB: Change output of a rejected send found in a block"
     );
     #[allow(clippy::cast_sign_loss)]
@@ -799,7 +796,6 @@ pub fn relock_inputs_for_revived_send(
 pub fn mark_change_output_rejected(conn: &Connection, created_by_request_id: &str) -> WalletDbResult<()> {
     warn!(
         target: "audit",
-        request_id = created_by_request_id;
         "DB: Marking unconfirmed change output rejected"
     );
     conn.execute(
@@ -1297,8 +1293,7 @@ pub fn lock_output(
 ) -> WalletDbResult<()> {
     info!(
         target: "audit",
-        output_id = output_id,
-        request_id = locked_by_request_id;
+        output_id = output_id;
         "DB: Locking output"
     );
 
@@ -1323,8 +1318,7 @@ pub fn lock_output(
     if rows_locked == 0 {
         warn!(
             target: "audit",
-            output_id = output_id,
-            request_id = locked_by_request_id;
+            output_id = output_id;
             "DB: Output is no longer unspent; lock lost the race"
         );
         return Err(WalletDbError::OutputLockConflict {
@@ -1458,10 +1452,7 @@ pub fn fetch_unspent_outputs(
 }
 
 pub fn unlock_outputs_for_request(conn: &Connection, locked_by_request_id: &str) -> WalletDbResult<()> {
-    debug!(
-        request_id = locked_by_request_id;
-        "DB: Unlocking outputs for request"
-    );
+    debug!("DB: Unlocking outputs for request");
 
     let unspent_status = OutputStatus::Unspent.to_string();
     let locked_status = OutputStatus::Locked.to_string();

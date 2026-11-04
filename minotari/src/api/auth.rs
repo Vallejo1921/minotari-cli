@@ -45,7 +45,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use log::warn;
+use log::{trace, warn};
 use rand::{Rng, distributions::Alphanumeric, thread_rng};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -206,21 +206,15 @@ pub async fn require_api_token(State(token): State<ApiToken>, request: Request, 
     match presented {
         Some(presented) if token.matches(&presented) => next.run(request).await,
         Some(_) => {
-            warn!(
-                target: "audit",
-                method:% = request.method(),
-                path = request.uri().path();
-                "API: rejected request with an invalid API token"
-            );
+            warn!(target: "audit", method:% = request.method(); "API: rejected request with an invalid API token");
+            // The path can name a wallet and a payment reference.
+            trace!(target: "audit", path = request.uri().path(); "API: rejected request path");
             unauthorized("Invalid API token")
         },
         None => {
-            warn!(
-                target: "audit",
-                method:% = request.method(),
-                path = request.uri().path();
-                "API: rejected request with no API token"
-            );
+            warn!(target: "audit", method:% = request.method(); "API: rejected request with no API token");
+            // The path can name a wallet and a payment reference.
+            trace!(target: "audit", path = request.uri().path(); "API: rejected request path");
             unauthorized("Missing API token. Send 'Authorization: Bearer <token>' or 'X-API-Key: <token>'.")
         },
     }

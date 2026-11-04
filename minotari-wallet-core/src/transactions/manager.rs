@@ -75,7 +75,7 @@
 
 use anyhow::anyhow;
 use chrono::Utc;
-use log::{error, info, warn};
+use log::{error, info, trace, warn};
 use r2d2::PooledConnection;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::Connection;
@@ -116,7 +116,9 @@ use crate::{
         },
         fee_estimator::{estimated_output_size_for_recipients, one_sided_output_sizes},
         fund_locker::{check_replay_allowed, lock_expiry_at, validate_fee_per_gram},
-        idempotency::{IdempotencyBinding, IdempotencyConflict, IdempotencyOperation, RequestFingerprint},
+        idempotency::{
+            IdempotencyBinding, IdempotencyConflict, IdempotencyOperation, RequestFingerprint, loggable_error,
+        },
         input_selector::{InputSelector, UtxoSelection, map_change_required_error},
         one_sided_transaction::{Recipient, check_recipient_networks, total_recipient_amount},
     },
@@ -636,7 +638,6 @@ impl TransactionSender {
         let total_amount = total_recipient_amount(&recipients, self.network)?;
         info!(
             target: "audit",
-            idempotency_key = idempotency_key.as_str(),
             recipient_count = recipients.len(),
             amount = &*mask_amount(total_amount);
             "Starting new transaction"
@@ -681,7 +682,6 @@ impl TransactionSender {
     ) -> Result<PrepareOneSidedTransactionForSigningResult, anyhow::Error> {
         info!(
             target: "audit",
-            idempotency_key = idempotency_key.as_str();
             "Starting new send-all transaction"
         );
         // The amount is filled in once the inputs are known.
@@ -794,7 +794,7 @@ impl TransactionSender {
                 Ok(res)
             },
             Err(e) => {
-                warn!(target: "audit", error:% = e; "Transaction creation failed");
+                warn!(target: "audit", error:% = loggable_error(&e); "Transaction creation failed");
                 // Only tear down a reservation this send actually took. A replay
                 // was handed someone else's, and that someone may still be
                 // building an unsigned transaction over the very UTXOs this
@@ -869,7 +869,8 @@ impl TransactionSender {
         let processed_transaction = &self.processed_transactions;
         let account_id = self.account.id;
 
-        info!(
+        info!(target: "audit", "Finalizing and broadcasting transaction");
+        trace!(
             target: "audit",
             id = processed_transaction.id();
             "Finalizing and broadcasting transaction"
@@ -877,7 +878,7 @@ impl TransactionSender {
 
         self.check_if_transaction_expired(&connection, processed_transaction)
             .inspect_err(|e| {
-                warn!(target: "audit", error:% = e; "Transaction finalization preparation failed");
+                warn!(target: "audit", error:% = loggable_error(e); "Transaction finalization preparation failed");
                 self.release_unclaimed_reservation(&connection, processed_transaction);
             })?;
 
@@ -913,7 +914,7 @@ impl TransactionSender {
             .map_err(|e| anyhow!("Invalid base node URL: {}", e))
             .and_then(WalletHttpClient::new)
             .inspect_err(|e| {
-                warn!(target: "audit", error:% = e; "Transaction finalization preparation failed");
+                warn!(target: "audit", error:% = loggable_error(e); "Transaction finalization preparation failed");
                 self.release_unclaimed_reservation(&connection, processed_transaction);
             })?;
 
@@ -973,7 +974,7 @@ impl TransactionSender {
         // reservation is as it was (`PENDING` unless another request claimed or
         // released it), and is released like any failure before the claim.
         record_result.inspect_err(|e| {
-            warn!(target: "audit", error:% = e; "Transaction finalization preparation failed");
+            warn!(target: "audit", error:% = loggable_error(e); "Transaction finalization preparation failed");
             self.release_unclaimed_reservation(&connection, processed_transaction);
         })?;
 
@@ -993,7 +994,6 @@ impl TransactionSender {
         if let Err(e) = persist_first_displayed_transaction(&mut connection, &mut displayed_transaction) {
             warn!(
                 target: "audit",
-                id = completed_tx_id.to_string().as_str(),
                 error:% = e;
                 "Could not reconcile the displayed transaction for a recorded send; the scan will add it"
             );
@@ -1126,10 +1126,10 @@ impl TransactionSender {
         };
         warn!(
             target: "audit",
-            id = processed_transaction.id(),
-            error:% = conflict;
+            kind = conflict.kind();
             "Refusing to broadcast a reservation this request does not hold"
         );
+        trace!(target: "audit", error:% = conflict; "Reservation conflict");
         Err(conflict.into())
     }
 
@@ -1151,7 +1151,6 @@ impl TransactionSender {
         if !processed_transaction.owns_reservation() {
             warn!(
                 target: "audit",
-                id = processed_transaction.id();
                 "Leaving a replayed reservation locked for the request that created it"
             );
             return;
@@ -1161,7 +1160,6 @@ impl TransactionSender {
             Ok(true) => {},
             Ok(false) => warn!(
                 target: "audit",
-                id = processed_transaction.id();
                 "Leaving a reservation that is no longer pending to whoever claimed it"
             ),
             Err(e) => {
@@ -1226,7 +1224,8 @@ pub fn record_first_broadcast(
 ) -> FirstBroadcast {
     let (mut first_broadcast, recorded) = match response {
         Ok(submission) if submission.accepted => {
-            info!(
+            info!(target: "audit", "Transaction accepted by network");
+            trace!(
                 target: "audit",
                 id = completed_tx_id.to_string().as_str();
                 "Transaction accepted by network"
@@ -1238,7 +1237,8 @@ pub fn record_first_broadcast(
             (FirstBroadcast::accepted(), recorded)
         },
         Ok(submission) if submission.rejection_reason == TxSubmissionRejectionReason::AlreadyMined => {
-            info!(
+            info!(target: "audit", "Transaction already mined by network");
+            trace!(
                 target: "audit",
                 id = completed_tx_id.to_string().as_str();
                 "Transaction already mined by network"
@@ -1250,7 +1250,6 @@ pub fn record_first_broadcast(
                 crate::log::sanitize_node_text(&format!("Transaction not accepted: {}", submission.rejection_reason));
             warn!(
                 target: "audit",
-                id = completed_tx_id.to_string().as_str(),
                 reason:% = reason;
                 "Transaction not accepted by the network yet; it is recorded and will be rebroadcast"
             );
@@ -1263,7 +1262,6 @@ pub fn record_first_broadcast(
             let reason = crate::log::sanitize_node_text(&e.to_string());
             warn!(
                 target: "audit",
-                id = completed_tx_id.to_string().as_str(),
                 reason:% = reason;
                 "Transaction submission failed; it is recorded and will be rebroadcast"
             );
@@ -1285,8 +1283,7 @@ pub fn record_first_broadcast(
                         && send.last_rejected_reason.as_deref()
                             == Some(crate::transactions::abandon::ABANDONED_REASON) =>
                 {
-                    warn!(target: "audit", id = completed_tx_id.to_string().as_str();
-                        "The node accepted a send after the user abandoned it");
+                    warn!(target: "audit", "The node accepted a send after the user abandoned it");
                     first_broadcast.accepted_after_abandon = true;
                 },
                 _ => first_broadcast.local_record_lagging = true,
@@ -1296,7 +1293,6 @@ pub fn record_first_broadcast(
         Some(Err(e)) => {
             warn!(
                 target: "audit",
-                id = completed_tx_id.to_string().as_str(),
                 error:% = e;
                 "Could not record the node's answer for a recorded send; the monitor and scan will catch up"
             );
@@ -1305,7 +1301,6 @@ pub fn record_first_broadcast(
         None => {
             warn!(
                 target: "audit",
-                id = completed_tx_id.to_string().as_str();
                 "No database connection to record the node's answer for a recorded send; the monitor and scan will \
                  catch up"
             );

@@ -305,7 +305,6 @@ fn resolve_replay(conn: &Connection, binding: &IdempotencyBinding, account_id: i
 
     info!(
         target: "audit",
-        idempotency_key = key,
         operation = binding.operation().as_str();
         "Found existing pending transaction lock"
     );
@@ -690,17 +689,14 @@ pub fn release_reservation(conn: &Connection, reservation_id: &str) {
     match db::expire_and_unlock_pending_transaction(conn, reservation_id) {
         Ok(true) => info!(
             target: "audit",
-            id = reservation_id;
             "Released the reservation of a failed send"
         ),
         Ok(false) => warn!(
             target: "audit",
-            id = reservation_id;
             "Leaving a reservation that is no longer pending to whoever claimed it"
         ),
         Err(e) => error!(
             target: "audit",
-            id = reservation_id,
             error:% = e;
             "Failed to release the reservation of a failed send"
         ),

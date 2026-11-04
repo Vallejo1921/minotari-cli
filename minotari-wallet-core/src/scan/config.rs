@@ -81,7 +81,9 @@ pub enum ScanMode {
     /// Scan a limited number of blocks, then stop.
     ///
     /// Useful for incremental synchronization or testing. The scanner will
-    /// return `more_blocks = true` if the chain tip was not reached.
+    /// return `more_blocks = true` if the chain tip was not reached. Can be
+    /// combined with [`Scanner::deadline`](crate::scan::Scanner::deadline):
+    /// the first limit reached stops the scan with `BudgetExhausted`.
     Partial {
         /// Maximum number of blocks to scan before stopping.
         max_blocks: u64,

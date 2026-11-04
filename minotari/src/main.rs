@@ -57,7 +57,7 @@ use std::{
 
 use anyhow::anyhow;
 use clap::Parser;
-use log::info;
+use log::{info, trace};
 use minotari::{
     ScanError,
     api::{ApiAuth, accounts::LockFundsRequest, auth::API_TOKEN_ENV_VAR, resolve_api_token},
@@ -136,11 +136,8 @@ async fn main() -> Result<(), anyhow::Error> {
                 TariAddressFeatures::create_one_sided_only(),
                 None,
             )?;
-            info!(
-                target: "audit",
-                address:% = tari_address;
-                "New address generated"
-            );
+            info!(target: "audit", "New address generated");
+            trace!(target: "audit", address:% = tari_address; "New address generated");
 
             let wallet_data = if let Some(password) = password {
                 // Each field gets its own nonce: XChaCha20 is a stream cipher, so encrypting two
@@ -531,7 +528,12 @@ async fn main() -> Result<(), anyhow::Error> {
             sidechain_deployment_key,
             seconds_to_lock,
         } => {
-            info!(target: "audit", account = account_name.as_str(); "Registering validator node...");
+            info!(target: "audit", "Registering validator node...");
+            trace!(
+                target: "audit",
+                account = account_name.as_str();
+                "Registering validator node..."
+            );
 
             wallet_config.apply_node(&node);
             wallet_config.apply_database(&db);
@@ -573,7 +575,12 @@ async fn main() -> Result<(), anyhow::Error> {
             sidechain_deployment_key,
             seconds_to_lock,
         } => {
-            info!(target: "audit", account = account_name.as_str(); "Submitting validator node exit...");
+            info!(target: "audit", "Submitting validator node exit...");
+            trace!(
+                target: "audit",
+                account = account_name.as_str();
+                "Submitting validator node exit..."
+            );
 
             wallet_config.apply_node(&node);
             wallet_config.apply_database(&db);
@@ -607,7 +614,13 @@ async fn main() -> Result<(), anyhow::Error> {
             accept_unreconcilable,
         } => {
             let name = account.account_name.as_deref().unwrap_or("default");
-            info!(target: "audit", account = name, tx_id = tx_id; "Abandoning send...");
+            info!(target: "audit", "Abandoning send...");
+            trace!(
+                target: "audit",
+                account = name,
+                tx_id = tx_id;
+                "Abandoning send..."
+            );
 
             wallet_config.apply_database(&db);
             let webhook_trigger_config = wallet_config.webhook.url.clone().map(|url| WebhookTriggerConfig {
@@ -626,7 +639,12 @@ async fn main() -> Result<(), anyhow::Error> {
         },
         Commands::Delete { db, account } => {
             let name = account.account_name.as_deref().unwrap_or("default");
-            info!(target: "audit", account = name; "Deleting wallet...");
+            info!(target: "audit", "Deleting wallet...");
+            trace!(
+                target: "audit",
+                account = name;
+                "Deleting wallet..."
+            );
 
             wallet_config.apply_database(&db);
 
@@ -645,9 +663,13 @@ async fn main() -> Result<(), anyhow::Error> {
         } => {
             info!(
                 target: "audit",
-                source = source_db.display().to_string().as_str(),
-                account = account_name.as_str(),
                 dry_run = dry_run;
+                "Migrating from console wallet"
+            );
+            trace!(
+                target: "audit",
+                source = source_db.display().to_string().as_str(),
+                account = account_name.as_str();
                 "Migrating from console wallet"
             );
 
