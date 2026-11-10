@@ -7,3 +7,5 @@ logs/
 .DS_Store
 
 .claude/
+config.bat
+node_modules
