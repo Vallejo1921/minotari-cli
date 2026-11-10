@@ -884,7 +884,36 @@ impl TransactionSender {
 
         // Extract transaction info from the signed result for building DisplayedTransaction
         let tx_info = &signed_transaction_result.request.info;
-        let actual_fee = tx_info.fee;
+        let actual_fee = {
+            let kernel_fee = signed_transaction_result
+                .signed_transaction
+                .transaction
+                .body()
+                .get_total_fee()
+                .unwrap_or_default();
+            if kernel_fee > MicroMinotari::zero() {
+                kernel_fee
+            } else if tx_info.fee > MicroMinotari::zero() {
+                tx_info.fee
+            } else {
+                db::find_pending_transaction_record_by_idempotency_key(
+                    &connection,
+                    &processed_transaction.idempotency_key,
+                    account_id,
+                )
+                .ok()
+                .flatten()
+                .map(|rec| {
+                    if signed_transaction_result.signed_transaction.change_output.is_some() {
+                        rec.fee_with_change
+                    } else {
+                        rec.fee_without_change
+                    }
+                })
+                .filter(|f| *f > MicroMinotari::zero())
+                .unwrap_or(tx_info.fee)
+            }
+        };
         let kernel_excess = signed_transaction_result
             .signed_transaction
             .transaction
@@ -2735,6 +2764,38 @@ mod tests {
         // The send itself is recorded, inputs still locked.
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM completed_transactions"), 1);
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM outputs WHERE status = 'LOCKED'"), 1);
+    }
+
+    #[tokio::test]
+    async fn finalizing_one_sided_send_populates_fee_on_displayed_transaction() {
+        let (pool, _temp) = setup_funded_wallet(3);
+        let (sender, signed) = prepared_send(&pool);
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": { "accepted": true, "rejection_reason": "None", "is_synced": true },
+                "error": null,
+                "id": "1",
+            })))
+            .mount(&server)
+            .await;
+
+        // tx_info.fee is initially 0 (minotari-cli#169)
+        assert_eq!(signed.request.info.fee, MicroMinotari(0));
+
+        let finalized = sender
+            .finalize_transaction_and_broadcast(signed, server.uri())
+            .await
+            .expect("finalize");
+
+        let fee = finalized.displayed_transaction.fee.expect("fee must be populated");
+        assert!(fee.amount > MicroMinotari(0), "fee should be non-zero, got: {:?}", fee);
+
+        let conn = pool.get().expect("conn");
+        let stored = db::get_displayed_transaction_by_id(&conn, &finalized.displayed_transaction.id.to_string())
+            .expect("fetch")
+            .expect("found tx in history");
+        assert_eq!(stored.fee.map(|f| f.amount), Some(fee.amount));
     }
 
     // -----------------------------------------------------------------------
